@@ -8738,7 +8738,6 @@ body.dragging-files * {
 .tfa-mode-card.feat { border: 2px solid var(--accent); background: var(--accent-soft); }
 .tfa-badge { display: inline-block; font-size: 11px; padding: 1px 10px; border-radius: 999px; }
 .tfa-badge.reco { background: var(--accent-soft-strong); color: var(--accent); }
-.tfa-badge.light { background: var(--bg-subtle); color: var(--text-muted); }
 .tfa-mode-title { font-size: 14px; font-weight: 600; color: var(--text); margin: 10px 0 4px; }
 .tfa-mode-desc { font-size: 12px; color: var(--text-dim); line-height: 1.6; margin-bottom: 12px; }
 
@@ -8766,12 +8765,12 @@ body.dragging-files * {
 .tfa-qr-wrap { flex-shrink: 0; padding: 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 14px; }
 .tfa-qr-img { display: block; width: 180px; height: 180px; border-radius: 10px; }
 .tfa-qr-ph { width: 180px; height: 180px; display: flex; align-items: center; justify-content: center; color: var(--text-faint); font-size: 12px; }
-.tfa-secret-label { font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
-.tfa-secret-box { display: inline-block; font-family: 'JetBrains Mono', monospace; font-size: 12px; background: var(--bg-subtle); color: var(--text); padding: 6px 10px; border-radius: 6px; user-select: all; }
-.tfa-backup-label { margin: 12px 0 4px; font-size: 12px; color: var(--red); }
+.tfa-secret-label { font-size: 14px; color: var(--text-dim); margin-bottom: 6px; }
+.tfa-secret-box { display: inline-block; font-family: 'JetBrains Mono', monospace; font-size: 18px; background: var(--bg-subtle); color: var(--text); padding: 8px 14px; border-radius: 8px; user-select: all; }
+.tfa-backup-label { margin: 14px 0 8px; font-size: 14px; color: var(--red); }
 .tfa-backup-chips { display: flex; gap: 8px; flex-wrap: wrap; }
-.tfa-backup-chip { font-family: 'JetBrains Mono', monospace; font-size: 12px; background: var(--bg-subtle); color: var(--text-muted); padding: 3px 9px; border-radius: 6px; }
-.tfa-saved-row { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--text); margin-top: 14px; cursor: pointer; }
+.tfa-backup-chip { font-family: 'JetBrains Mono', monospace; font-size: 16px; background: var(--bg-subtle); color: var(--text-muted); padding: 5px 12px; border-radius: 8px; }
+.tfa-saved-row { display: flex; gap: 6px; align-items: center; font-size: 15px; color: var(--text); margin-top: 16px; cursor: pointer; }
 
 .tfa-wizard-foot { margin-top: 18px; display: flex; justify-content: flex-end; gap: 8px; align-items: center; flex-wrap: wrap; }
 

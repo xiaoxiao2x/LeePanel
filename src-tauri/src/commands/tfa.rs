@@ -16,14 +16,12 @@ use crate::DbPool;
 
 #[derive(Serialize, Clone, Debug)]
 pub struct TfaStatus {
-    /// 整体判定：TOTP 全套就绪 或 轻量模式已启用。
+    /// 整体判定：TOTP 全套就绪。
     pub enabled: bool,
     pub installed: bool,
     pub pam_configured: bool,
     pub sshd_configured: bool,
     pub secret_initialized: bool,
-    /// 轻量双因素（AuthenticationMethods publickey,password）已启用。
-    pub light_enabled: bool,
     /// 该服务器是否支持 2FA 配置（一期仅 direct_root + root 身份）。
     pub configurable: bool,
 }
@@ -62,7 +60,6 @@ command -v google-authenticator >/dev/null 2>&1 && echo "INSTALLED=yes" || echo 
 grep -q "pam_google_authenticator" /etc/pam.d/sshd 2>/dev/null && echo "PAM=yes" || echo "PAM=no"
 grep -Eq "^[[:space:]]*KbdInteractiveAuthentication[[:space:]]+yes|^[[:space:]]*ChallengeResponseAuthentication[[:space:]]+yes" /etc/ssh/sshd_config 2>/dev/null && echo "KBD=yes" || echo "KBD=no"
 grep -q "^[[:space:]]*AuthenticationMethods" /etc/ssh/sshd_config 2>/dev/null && echo "AM=yes" || echo "AM=no"
-grep -q "^[[:space:]]*AuthenticationMethods[[:space:]]\+publickey,password" /etc/ssh/sshd_config 2>/dev/null && echo "LIGHT=yes" || echo "LIGHT=no"
 [ -f ~/.google_authenticator ] && echo "SECRET=yes" || echo "SECRET=no"
 "#;
     let (stdout, _, code) = ssh::session_exec_with_output(&session, script, 10).await?;
@@ -75,7 +72,6 @@ grep -q "^[[:space:]]*AuthenticationMethods[[:space:]]\+publickey,password" /etc
         pam_configured: false,
         sshd_configured: false,
         secret_initialized: false,
-        light_enabled: false,
         configurable,
     };
     for line in stdout.lines() {
@@ -85,14 +81,13 @@ grep -q "^[[:space:]]*AuthenticationMethods[[:space:]]\+publickey,password" /etc
                 "INSTALLED" => st.installed = yes,
                 "PAM" => st.pam_configured = yes,
                 "KBD" | "AM" => if yes { st.sshd_configured = true },
-                "LIGHT" => st.light_enabled = yes,
                 "SECRET" => st.secret_initialized = yes,
                 _ => {}
             }
         }
     }
     let totp_ready = st.installed && st.pam_configured && st.sshd_configured && st.secret_initialized;
-    st.enabled = totp_ready || st.light_enabled;
+    st.enabled = totp_ready;
     Ok(st)
 }
 
@@ -198,49 +193,6 @@ echo "CONFIGURED"
     Ok(stdout.trim().to_string())
 }
 
-/// 轻量双因素（P4）：仅写 sshd_config 强制 `AuthenticationMethods publickey,password`。
-/// 无需装包/生成 secret；复用备份 + `sshd -t` 预检 + 自动回滚机制。
-#[tauri::command]
-pub async fn tfa_configure_light(
-    ssh_mgr: State<'_, Arc<AsyncMutex<SshManager>>>,
-    db: State<'_, DbPool>,
-    session_id: String,
-) -> Result<String, String> {
-    let mgr = ssh_mgr.lock().await;
-    let session = mgr.get_session(&session_id)?;
-    require_root(&session)?;
-    let host = session.connect_info.host.clone();
-    let username = session.connect_info.username.clone();
-    drop(mgr);
-
-    let script = r#"
-set -e
-TS=$(date +%s)
-BK=/etc/leepanel-tfa-backups
-mkdir -p "$BK"
-cp /etc/ssh/sshd_config "$BK/sshd_config.$TS" 2>/dev/null || true
-echo "$TS" > "$BK/latest"
-sed -i '/^[[:space:]]*AuthenticationMethods/d' /etc/ssh/sshd_config
-printf '%s\n' 'AuthenticationMethods publickey,password' >> /etc/ssh/sshd_config
-if ! sshd -t 2>/tmp/leepanel-sshd-t.err; then
-  cp "$BK/sshd_config.$TS" /etc/ssh/sshd_config
-  rm -f "$BK/sshd_config.$TS"
-  echo "SSHD_TEST_FAILED"
-  cat /tmp/leepanel-sshd-t.err
-  exit 1
-fi
-systemctl reload sshd 2>/dev/null || service ssh reload 2>/dev/null || service sshd reload 2>/dev/null || true
-echo "CONFIGURED"
-"#;
-    let (stdout, _, code) = ssh::session_exec_with_output(&session, script, 30).await?;
-    if code != 0 {
-        audit_log(&db.lock().unwrap(), &host, &username, "tfa_configure_light", "force publickey,password auth", "failed", &stdout.trim());
-        return Err(format!("Light 2FA configure failed (config rolled back): {}", stdout.trim()));
-    }
-    audit_log(&db.lock().unwrap(), &host, &username, "tfa_configure_light", "force publickey,password auth", "success", "");
-    Ok(stdout.trim().to_string())
-}
-
 /// 初始化 TOTP secret（非交互生成），返回 base32 secret + otpauth URI + 备用码。
 /// secret 仅经加密通道回传前端展示，不落库、不进日志。
 #[tauri::command]
@@ -261,10 +213,10 @@ pub async fn tfa_enroll(
     //   读 /dev/tty 失败（getline(): Inappropriate ioctl for device）导致退出码非 0
     // - `-Q none`：不输出终端二维码（前端自己绘制），避免 ANSI/UTF8 乱码
     let script = r#"
-google-authenticator -t -d -f -r 3 -R 30 -w 3 -C -Q none < /dev/null 2>&1
+google-authenticator -t -d -f -r 3 -R 30 -w 3 -C -Q none -e 10 < /dev/null 2>&1
 "#;
     let (stdout, _, code) = ssh::session_exec_with_output(&session, script, 30).await?;
-    // 解析：第一行 "Your new secret key is: <BASE32>"；emergency scratch codes 其后 5 个
+    // 解析：第一行 "Your new secret key is: <BASE32>"；emergency scratch codes 其后 N 个（-e 10 生成）
     let mut secret = String::new();
     let mut backup_codes: Vec<String> = Vec::new();
     let mut in_codes = false;
@@ -282,7 +234,7 @@ google-authenticator -t -d -f -r 3 -R 30 -w 3 -C -Q none < /dev/null 2>&1
             if !code.is_empty() {
                 backup_codes.push(code.to_string());
             }
-            if backup_codes.len() >= 5 {
+            if backup_codes.len() >= 10 {
                 break;
             }
         }

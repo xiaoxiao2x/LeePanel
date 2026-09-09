@@ -9,7 +9,6 @@ interface TfaStatus {
   pam_configured: boolean
   sshd_configured: boolean
   secret_initialized: boolean
-  light_enabled: boolean
   configurable: boolean
 }
 
@@ -21,7 +20,6 @@ interface EnrollResult {
 
 interface TwoFaPanelProps {
   sessionId: string | null
-  connId?: string
 }
 
 // ===== RFC 6238 TOTP（前端本地校验，无需服务端额外工具） =====
@@ -72,9 +70,8 @@ async function computeTotp(secret: string, timeStep = 30): Promise<string> {
 
 // ===== 页面状态机 =====
 // status        状态视图（未开启 → 模式卡片；已开启 → 管理操作）
-// wizard-totp   TOTP 三步向导：prepare（环境准备，自动串行）→ bind（扫码绑定）→ verify（验证生效）→ done
-// wizard-light  轻量双因素单步确认
-type ViewState = 'status' | 'wizard-totp' | 'wizard-light'
+// wizard-totp   TOTP 三步向导：prepare（仅安装组件）→ bind（扫码绑定）→ verify（验证码通过后写入配置）→ done
+type ViewState = 'status' | 'wizard-totp'
 type TotpStep = 'prepare' | 'bind' | 'verify' | 'done'
 type StepState = 'pending' | 'running' | 'done' | 'failed' | 'skipped'
 
@@ -82,7 +79,7 @@ const STEP_ICON: Record<StepState, string> = {
   pending: '○', running: '↻', done: '✓', failed: '✗', skipped: '✓',
 }
 
-export default function TwoFaPanel({ sessionId, connId }: TwoFaPanelProps) {
+export default function TwoFaPanel({ sessionId }: TwoFaPanelProps) {
   const { t } = useTranslation()
   const [view, setView] = useState<ViewState>('status')
   const [status, setStatus] = useState<TfaStatus | null>(null)
@@ -93,7 +90,6 @@ export default function TwoFaPanel({ sessionId, connId }: TwoFaPanelProps) {
   // TOTP 向导
   const [totpStep, setTotpStep] = useState<TotpStep>('prepare')
   const [installState, setInstallState] = useState<StepState>('pending')
-  const [configState, setConfigState] = useState<StepState>('pending')
   const [enrollData, setEnrollData] = useState<EnrollResult | null>(null)
   const [existingSecret, setExistingSecret] = useState(false)
   const [savedBackup, setSavedBackup] = useState(false)
@@ -131,7 +127,7 @@ export default function TwoFaPanel({ sessionId, connId }: TwoFaPanelProps) {
     if (enrollData) {
       QRCode.toDataURL(enrollData.otpauth_uri, { width: 180, margin: 1, errorCorrectionLevel: 'M' })
         .then(url => { if (!cancelled) setQrDataUrl(url) })
-        .catch(e => { if (!cancelled) setError(`QR error: ${e}`) })
+        .catch(e => { if (!cancelled) setError(`${t('tfa.qrError')}: ${e}`) })
     } else {
       setQrDataUrl('')
     }
@@ -155,33 +151,23 @@ export default function TwoFaPanel({ sessionId, connId }: TwoFaPanelProps) {
     }
   }
 
-  // 环境准备：自动串行 安装 → 配置，每步可视进度；失败停住可重试
+  // 环境准备：仅安装组件（enroll 生成密钥的前置依赖）；
+  // 写入 PAM/sshd 配置（真正影响服务器认证的一步）推迟到 Step3 验证码通过后自动执行。
   const runPrepare = async () => {
     if (!sessionId) return
     setError('')
     try {
       const s = await invoke<TfaStatus>('tfa_get_status', { sessionId })
       setStatus(s)
-      const needsInstall = !s.installed
-      const needsConfig = !(s.pam_configured && s.sshd_configured)
-      setInstallState(needsInstall ? 'running' : 'skipped')
-      setConfigState(needsConfig ? 'running' : 'skipped')
-      if (needsInstall) {
+      if (s.installed) {
+        setInstallState('skipped')
+      } else {
+        setInstallState('running')
         try {
           await invoke<string>('tfa_install', { sessionId })
           setInstallState('done')
         } catch (e) {
           setInstallState('failed')
-          setError(String(e))
-          return
-        }
-      }
-      if (needsConfig) {
-        try {
-          await invoke<string>('tfa_configure', { sessionId })
-          setConfigState('done')
-        } catch (e) {
-          setConfigState('failed')
           setError(String(e))
           return
         }
@@ -211,66 +197,40 @@ export default function TwoFaPanel({ sessionId, connId }: TwoFaPanelProps) {
     setVerifyInput('')
     setError('')
     setNotice('')
+    setInstallState('pending')
     setTotpStep('prepare')
     setView('wizard-totp')
     await runPrepare()
   }
 
-  const startLight = () => {
-    if (!status?.configurable) {
-      setError(t('tfa.rootRequired'))
-      return
-    }
-    setError('')
-    setNotice('')
-    setView('wizard-light')
-  }
-
-  const confirmLight = async () => {
-    if (!sessionId) return
-    setBusy('configure')
-    setError('')
-    try {
-      await invoke<string>('tfa_configure_light', { sessionId })
-      if (connId) {
-        await invoke('config_set_tfa_enabled', { configId: connId, enabled: true, tfaType: 'keypass' }).catch(() => {})
-      }
-      window.dispatchEvent(new CustomEvent('tfa-status-changed'))
-      setView('status')
-      await refresh()
-    } catch (e) {
-      setError(String(e))
-    } finally {
-      setBusy('')
-    }
-  }
-
-  // 校验验证码：通过 → 标记生效 → 成功反馈 → 回状态视图
+  // 校验验证码：本地比对通过 → 若服务器 PAM/sshd 尚未配置（首次开启），此刻才写入配置并 reload
   const handleVerify = async () => {
     if (!enrollData || !sessionId) return
+    setBusy('apply')
+    setError('')
     try {
       const expected = await computeTotp(enrollData.secret)
       if (verifyInput.trim() !== expected) {
         setError(t('tfa.codeMismatch'))
         return
       }
+      // 验证码正确、App 已配对；服务器若未配好 PAM/sshd 则现在写入（备份 + 预检 + 自动回滚）
+      const s = await invoke<TfaStatus>('tfa_get_status', { sessionId })
+      if (!(s.pam_configured && s.sshd_configured)) {
+        await invoke<string>('tfa_configure', { sessionId })
+      }
+      setTotpStep('done')
+      setTimeout(() => {
+        setView('status')
+        setEnrollData(null)
+        setVerifyInput('')
+        refresh()
+      }, 1600)
     } catch (e) {
       setError(String(e))
-      return
+    } finally {
+      setBusy('')
     }
-    setError('')
-    if (connId) {
-      await invoke('config_set_tfa_enabled', { configId: connId, enabled: true, tfaType: 'totp' }).catch(() => {})
-    }
-    // 通知 App 刷新 Sidebar 连接列表（tfa_enabled 标记即时同步）
-    window.dispatchEvent(new CustomEvent('tfa-status-changed'))
-    setTotpStep('done')
-    setTimeout(() => {
-      setView('status')
-      setEnrollData(null)
-      setVerifyInput('')
-      refresh()
-    }, 1600)
   }
 
   const handleViewBackups = async () => {
@@ -302,11 +262,6 @@ export default function TwoFaPanel({ sessionId, connId }: TwoFaPanelProps) {
     setNotice('')
     try {
       await invoke<string>('tfa_disable', { sessionId })
-      if (connId) {
-        await invoke('config_set_tfa_enabled', { configId: connId, enabled: false }).catch(() => {})
-      }
-      // 通知 App 刷新 Sidebar 连接列表（tfa_enabled 即时同步，避免"已关闭仍弹验证码"）
-      window.dispatchEvent(new CustomEvent('tfa-status-changed'))
       setDisableConfirm(false)
       setView('status')
       await refresh()
@@ -322,7 +277,6 @@ export default function TwoFaPanel({ sessionId, connId }: TwoFaPanelProps) {
   }
 
   const enabled = status?.enabled ?? false
-  const lightOn = status?.light_enabled ?? false
   const configurable = status?.configurable ?? false
 
   return (
@@ -338,18 +292,18 @@ export default function TwoFaPanel({ sessionId, connId }: TwoFaPanelProps) {
               <div className={`tfa-status-icon ${enabled ? 'on' : 'off'}`}>{enabled ? '✓' : '🔐'}</div>
               <div style={{ flex: 1 }}>
                 <div className="tfa-status-title">
-                  {enabled ? (lightOn ? t('tfa.enabledLightHint') : t('tfa.totpOn')) : t('tfa.disabledHint')}
+                  {enabled ? t('tfa.totpOn') : t('tfa.disabledHint')}
                 </div>
                 <div className="tfa-status-sub">{t('tfa.sessionSafe')}</div>
               </div>
               {loading && <span className="tfa-status-spin">↻</span>}
             </div>
 
-            {!configurable && (
+            {status !== null && !configurable && (
               <div className="tfa-warn-line">⚠ {t('tfa.rootRequired')}</div>
             )}
 
-            {/* 未开启 → 模式选择卡片 */}
+            {/* 未开启 → TOTP 开启入口 */}
             {!enabled && (
               <div className="tfa-mode-grid">
                 <div className="tfa-mode-card feat">
@@ -360,26 +314,16 @@ export default function TwoFaPanel({ sessionId, connId }: TwoFaPanelProps) {
                     {t('tfa.startWizard')}
                   </button>
                 </div>
-                <div className="tfa-mode-card">
-                  <span className="tfa-badge light">{t('tfa.badgeLight')}</span>
-                  <div className="tfa-mode-title">{t('tfa.lightTitle')}</div>
-                  <div className="tfa-mode-desc">{t('tfa.lightDesc')}</div>
-                  <button className="sidebar-confirm-btn" onClick={startLight}>{t('tfa.enableLight')}</button>
-                </div>
               </div>
             )}
 
             {/* 已开启 → 管理操作 */}
             {enabled && (
               <div className="tfa-actions">
-                {!lightOn && (
-                  <>
-                    <button className="sidebar-confirm-btn" disabled={busy === 'backup'} onClick={handleViewBackups}>
-                      {busy === 'backup' ? '↻' : '👁'} {t('tfa.viewBackupCodes')}
-                    </button>
-                    <button className="sidebar-confirm-btn" onClick={() => setRegenConfirm(true)}>{t('tfa.regenKey')}</button>
-                  </>
-                )}
+                <button className="sidebar-confirm-btn" disabled={busy === 'backup'} onClick={handleViewBackups}>
+                  {busy === 'backup' ? '↻' : '👁'} {t('tfa.viewBackupCodes')}
+                </button>
+                <button className="sidebar-confirm-btn" onClick={() => setRegenConfirm(true)}>{t('tfa.regenKey')}</button>
                 {disableConfirm ? (
                   <span className="tfa-alert danger" style={{ display: 'inline-flex', gap: 8, alignItems: 'center', marginBottom: 0 }}>
                     <span>{t('tfa.disableConfirmMsg')}</span>
@@ -430,12 +374,11 @@ export default function TwoFaPanel({ sessionId, connId }: TwoFaPanelProps) {
             <StepDot state={totpStep === 'verify' ? 'active' : totpStep === 'done' ? 'done' : 'todo'} label={t('tfa.stepVerify')} step={3} />
           </div>
 
-          {/* Step 1 环境准备 */}
+          {/* Step 1 环境准备（仅安装组件；写配置在 Step3 验证通过后自动执行） */}
           {totpStep === 'prepare' && (
             <div>
               <PrepareRow label={t('tfa.stepInstallLabel')} state={installState} statusText={t('tfa.running')} failedText={t('tfa.stepFailedLabel')} skippedText={t('tfa.stepSkipped')} />
-              <PrepareRow label={t('tfa.stepConfigLabel')} state={configState} statusText={t('tfa.running')} failedText={t('tfa.stepFailedLabel')} skippedText={t('tfa.stepSkipped')} />
-              {(installState === 'failed' || configState === 'failed') && (
+              {installState === 'failed' && (
                 <div style={{ marginTop: 12 }}>
                   <button className="sidebar-confirm-btn primary" onClick={runPrepare}>{t('tfa.stepRetry')}</button>
                 </div>
@@ -471,9 +414,9 @@ export default function TwoFaPanel({ sessionId, connId }: TwoFaPanelProps) {
                 <div className="tfa-bind">
                   <div className="tfa-qr-wrap">
                     {qrDataUrl ? (
-                      <img src={qrDataUrl} alt="TOTP QR" className="tfa-qr-img" />
+                      <img src={qrDataUrl} alt={t('tfa.qrAlt')} className="tfa-qr-img" />
                     ) : (
-                      <div className="tfa-qr-ph">QR…</div>
+                      <div className="tfa-qr-ph">{t('tfa.qrPlaceholder')}</div>
                     )}
                   </div>
                   <div style={{ flex: 1, minWidth: 0 }}>
@@ -516,7 +459,7 @@ export default function TwoFaPanel({ sessionId, connId }: TwoFaPanelProps) {
             </div>
           )}
 
-          {/* Step 3 验证生效 */}
+          {/* Step 3 验证生效：验证码通过后自动写入服务器配置（PAM/sshd + reload） */}
           {totpStep === 'verify' && enrollData && (
             <div>
               <div className="settings-muted" style={{ marginBottom: 10 }}>{t('tfa.verifyHint')}</div>
@@ -525,16 +468,17 @@ export default function TwoFaPanel({ sessionId, connId }: TwoFaPanelProps) {
                   className="sidebar-edit-input"
                   style={{ width: 140, textAlign: 'center', letterSpacing: 4, fontSize: 16 }}
                   value={verifyInput}
-                  onChange={(e) => setVerifyInput(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  disabled={busy === 'apply'}
+                  onChange={(e) => setVerifyInput(e.target.value.replace(/\D/g, ''))}
                   placeholder="••••••"
                   autoFocus
                   autoComplete="off"
-                  onKeyDown={(e) => { if (e.key === 'Enter' && verifyInput.length === 6) handleVerify() }}
+                  onKeyDown={(e) => { if (e.key === 'Enter' && verifyInput.length > 0 && busy !== 'apply') handleVerify() }}
                 />
-                <button className="sidebar-confirm-btn primary" disabled={verifyInput.length !== 6} onClick={handleVerify}>
-                  {t('tfa.verifyAndEnable')}
+                <button className="sidebar-confirm-btn primary" disabled={verifyInput.length === 0 || busy === 'apply'} onClick={handleVerify}>
+                  {busy === 'apply' ? t('tfa.configuring') : t('tfa.verifyAndEnable')}
                 </button>
-                <button className="sidebar-confirm-btn cancel" onClick={() => setTotpStep('bind')}>{t('tfa.back')}</button>
+                <button className="sidebar-confirm-btn cancel" disabled={busy === 'apply'} onClick={() => setTotpStep('bind')}>{t('tfa.back')}</button>
               </div>
             </div>
           )}
@@ -546,23 +490,6 @@ export default function TwoFaPanel({ sessionId, connId }: TwoFaPanelProps) {
               <span className="tfa-success-text">{t('tfa.enabledSuccess')}</span>
             </div>
           )}
-        </div>
-      )}
-
-      {/* ==================== 轻量模式确认页 ==================== */}
-      {view === 'wizard-light' && (
-        <div style={{ padding: '16px 16px 0' }}>
-          <div className="tfa-alert info">
-            <div className="t">{t('tfa.lightTitle')}</div>
-            <div>{t('tfa.lightDesc')}</div>
-          </div>
-          <div className="settings-muted" style={{ marginBottom: 16 }}>{t('tfa.safetyHint1')}</div>
-          <div className="tfa-wizard-foot">
-            <button className="sidebar-confirm-btn cancel" onClick={() => setView('status')}>{t('common.cancel')}</button>
-            <button className="sidebar-confirm-btn primary" disabled={busy === 'configure'} onClick={confirmLight}>
-              {busy === 'configure' ? t('tfa.configuring') : t('tfa.lightConfirm')}
-            </button>
-          </div>
         </div>
       )}
 
