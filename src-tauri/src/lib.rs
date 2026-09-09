@@ -22,6 +22,12 @@ type DbPool = std::sync::Mutex<SqliteConn>;
 pub(crate) type HostKeyPending =
     std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>;
 
+/// Pending 2FA code requests: session_id -> oneshot sender(code).
+/// Registered while authenticating (server asked for a verification code),
+/// resolved by `ssh_submit_tfa_code` from the connect-time TOTP dialog.
+pub(crate) type TfaCodePending =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<String>>>>;
+
 // ===== App Entry =====
 
 pub fn run() {
@@ -61,6 +67,11 @@ pub fn run() {
                 std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
             app.manage(host_key_pending);
 
+            // Pending 2FA verification-code requests (dynamic auth)
+            let tfa_code_pending: TfaCodePending =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            app.manage(tfa_code_pending);
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -74,17 +85,17 @@ pub fn run() {
             commands::ssh::ssh_compress, commands::ssh::ssh_extract, commands::ssh::ssh_reconnect,
             commands::ssh::ssh_generate_keypair, commands::ssh::save_key_to_local,
             commands::ssh::ssh_confirm_host_key,
+            commands::ssh::ssh_submit_tfa_code,
             commands::ssh::ssh_set_sudo_password, commands::ssh::ssh_generate_sudoers,
             // SSH 2FA（v9）
             commands::tfa::tfa_get_status, commands::tfa::tfa_install,
-            commands::tfa::tfa_configure, commands::tfa::tfa_configure_light,
+            commands::tfa::tfa_configure,
             commands::tfa::tfa_enroll, commands::tfa::tfa_read_secret, commands::tfa::tfa_disable,
             // Known hosts (SSH server identity, TOFU)
             commands::config::known_hosts_list, commands::config::known_hosts_delete,
             commands::config::known_hosts_add, commands::config::known_hosts_import_from_ssh,
             // Config
             commands::config::config_list, commands::config::config_save, commands::config::config_delete, commands::config::config_save_credentials,
-            commands::config::config_set_tfa_enabled,
             commands::config::clear_proxy_env,
             // Credentials (system keyring)
             commands::credentials::credential_set, commands::credentials::credential_get,
