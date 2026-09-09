@@ -47,10 +47,6 @@ interface SidebarConnection {
   auth_mode?: string
   sudo_password_mode?: string
   has_sudo_password?: boolean
-  // SSH 2FA（v9）：服务器已开启双因素认证
-  tfa_enabled?: boolean
-  tfa_type?: string
-  tfa_code?: string
 }
 
 interface Settings {
@@ -89,9 +85,11 @@ function App() {
   const termRefMap = useRef(new Map<string, TerminalHandle | null>())
   const activeTermRef = useRef<TerminalHandle | null>(null)
   const [errorDialog, setErrorDialog] = useState<{ visible: boolean; type: 'auth' | 'network' | 'connection' | 'key' | 'hostKey' | 'hostKeyChanged' | 'other'; messageKey?: string; params?: Record<string, string>; message?: string } | null>(null)
-  // SSH 2FA（v9）：连接已开启 2FA 的服务器时，需要用户输入 TOTP 验证码
-  const [tfaDialog, setTfaDialog] = useState<{ conn: SidebarConnection } | null>(null)
+  // SSH 2FA（v10）：认证中服务器要求验证码 → 后端发 'tfa-code-request' 事件 → 动态弹窗收集
+  const [tfaDialog, setTfaDialog] = useState<{ sessionId: string } | null>(null)
   const [tfaCodeInput, setTfaCodeInput] = useState('')
+  // 重新弹窗时提示"上次输入错误"（后端重试时 retry=true）
+  const [tfaRetryHint, setTfaRetryHint] = useState(false)
   const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null)
   // TOFU host-key verification (first-contact confirmation / key-changed warning)
   const [hostKeyPrompt, setHostKeyPrompt] = useState<{ sessionId: string; host: string; port: number; keyType: string; fingerprint: string } | null>(null)
@@ -806,17 +804,7 @@ function App() {
     handleDirectConnect(conn)
   }
 
-  const handleDirectConnect = useCallback(async (conn: SidebarConnection, tfaCodeOverride?: string) => {
-    // SSH 2FA 实时状态（v9）：关闭/开启 2FA 后 Sidebar 的连接数据可能过期（config_list 旧结果），
-    // 连接前按 configId 拉取最新 tfa_enabled，避免"已关闭仍弹验证码输入框 / 已开启却不提示"。
-    let liveTfaEnabled = conn.tfa_enabled ?? false
-    if (conn.id) {
-      try {
-        const list = await invoke<SidebarConnection[]>('config_list')
-        const fresh = list.find(c => c.id === conn.id)
-        if (fresh) liveTfaEnabled = fresh.tfa_enabled ?? false
-      } catch { /* 查询失败时沿用传入值 */ }
-    }
+  const handleDirectConnect = useCallback(async (conn: SidebarConnection) => {
     // ponytail: multi-session — if already connected, just switch tab
     const existing = sessions.find(s => s.configId === conn.id)
     const isConnected = existing !== undefined && connectedConfigIds.has(conn.id)
@@ -825,7 +813,7 @@ function App() {
       return
     }
 
-    const doConnect = (username: string, password?: string, keyPath?: string, passphrase?: string, configId?: string, tfaCode?: string) => {
+    const doConnect = (username: string, password?: string, keyPath?: string, passphrase?: string, configId?: string) => {
       setConnectingServerId(conn.id)
       setError('')
       const hostKey = `${conn.host}_${conn.port}`
@@ -836,7 +824,8 @@ function App() {
       // ponytail: parallel SSH + DB read → no flash, correct page rendered immediately
       // 凭据策略：前端显式传入的 password/passphrase 为会话级覆盖（优先）；
       // 未传入时 Rust 端按 configId 从系统钥匙串读取（已保存凭据不进前端）
-      // SSH 2FA（v9）：tfaEnabled 驱动后端走 keyboard-interactive 认证；tfaCode 仅本次会话使用
+      // SSH 2FA（v10）：无需本地标记——认证时服务器要求验证码，后端发 'tfa-code-request'
+      // 事件，本页动态弹窗收集后经 ssh_submit_tfa_code 回传。
       // NOTE: no client-side timeout here — the backend splits TCP connect (8s) from the
       // SSH handshake (90s), and the handshake may pause on first-contact host-key confirmation.
       Promise.all([
@@ -848,8 +837,6 @@ function App() {
             configId: configId || undefined,
             authMode: conn.auth_mode || 'direct_root',
             sudoPasswordMode: conn.sudo_password_mode || 'ask',
-            tfaEnabled: liveTfaEnabled,
-            tfaCode: tfaCode || conn.tfa_code || undefined,
             cols: estCols, rows: estRows,
           },
         }),
@@ -914,13 +901,9 @@ function App() {
       return
     }
 
-    // SSH 2FA（v9）：服务器已开启 2FA 且本次连接未提供验证码 → 先弹窗收集 TOTP
-    if (liveTfaEnabled && !(tfaCodeOverride || conn.tfa_code)) {
-      setTfaCodeInput('')
-      setTfaDialog({ conn })
-      return
-    }
-    doConnect(conn.username, password, keyPath, passphrase, configId, tfaCodeOverride || conn.tfa_code)
+    // SSH 2FA（v10）：无需本地标记预判——认证时服务器要求验证码，后端发
+    // 'tfa-code-request' 事件，由动态弹窗收集后回传，连接流程不在此阻塞。
+    doConnect(conn.username, password, keyPath, passphrase, configId)
   }, [sessions, connectedConfigIds])
 
   // Listen for reconnect-after-edit from Sidebar (Connect button)
@@ -946,11 +929,14 @@ function App() {
     return () => window.removeEventListener('sidebar-reconnect-after-edit', handler)
   }, [handleDirectConnect])
 
-  // SSH 2FA 状态变更（开启/关闭/轻量）：刷新 Sidebar 连接列表，使 tfa_enabled 标记即时同步
+  // SSH 2FA（v10）：认证中服务器要求验证码 → 动态弹窗收集 → ssh_submit_tfa_code 回传
   useEffect(() => {
-    const handler = () => setSidebarRefreshKey(k => k + 1)
-    window.addEventListener('tfa-status-changed', handler)
-    return () => window.removeEventListener('tfa-status-changed', handler)
+    const unlisten = listen<{ sessionId: string; retry?: boolean }>('tfa-code-request', (e) => {
+      setTfaCodeInput('')
+      setTfaRetryHint(!!e.payload.retry)
+      setTfaDialog({ sessionId: e.payload.sessionId })
+    })
+    return () => { unlisten.then(f => f()) }
   }, [])
 
   return (
@@ -1048,41 +1034,46 @@ function App() {
           </div>
         )}
 
-        {/* SSH 2FA（v9）：TOTP 验证码输入弹窗 */}
+        {/* SSH 2FA（v10）：认证中服务器要求验证码 → 动态弹窗 → ssh_submit_tfa_code 回传 */}
         {tfaDialog && (
-          <div className="error-dialog-overlay" onClick={() => setTfaDialog(null)}>
+          <div className="error-dialog-overlay" onClick={() => { setTfaDialog(null); setTfaRetryHint(false) }}>
             <div className="error-dialog" onClick={(e) => e.stopPropagation()}>
-              <button className="error-dialog-close" onClick={() => setTfaDialog(null)}>×</button>
+              <button className="error-dialog-close" onClick={() => { setTfaDialog(null); setTfaRetryHint(false) }}>×</button>
               <div className="error-dialog-icon">🔐</div>
               <div className="error-dialog-title">{t('tfa.codeRequired')}</div>
-              <div className="error-dialog-message">{t('tfa.codeRequiredHint', { host: tfaDialog.conn.name || tfaDialog.conn.host })}</div>
+              {tfaRetryHint && (
+                <div style={{ color: 'var(--red)', fontSize: 12, margin: '-4px 0 8px' }}>{t('tfa.codeRetryHint')}</div>
+              )}
+              <div className="error-dialog-message">{t('tfa.codeRequiredHint')}</div>
               <input
                 className="sidebar-edit-input"
                 style={{ width: '100%', boxSizing: 'border-box', marginBottom: 12, textAlign: 'center', letterSpacing: 4, fontSize: 16 }}
                 value={tfaCodeInput}
-                onChange={(e) => setTfaCodeInput(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                onChange={(e) => setTfaCodeInput(e.target.value.replace(/\D/g, ''))}
                 placeholder="••••••"
                 autoFocus
                 autoComplete="off"
                 onKeyDown={(e) => {
-                  if (e.key === 'Enter' && tfaCodeInput.length >= 6) {
-                    const conn = tfaDialog.conn
+                  if (e.key === 'Enter' && tfaCodeInput.length > 0) {
+                    const sessionId = tfaDialog.sessionId
                     setTfaDialog(null)
-                    handleDirectConnect(conn, tfaCodeInput)
+                    setTfaRetryHint(false)
+                    invoke('ssh_submit_tfa_code', { sessionId, code: tfaCodeInput }).catch(() => {})
                   }
                 }}
               />
               <div className="error-dialog-actions">
                 <button
                   className="error-dialog-btn primary"
-                  disabled={tfaCodeInput.length < 6}
+                  disabled={tfaCodeInput.length === 0}
                   onClick={() => {
-                    const conn = tfaDialog.conn
+                    const sessionId = tfaDialog.sessionId
                     setTfaDialog(null)
-                    handleDirectConnect(conn, tfaCodeInput)
+                    setTfaRetryHint(false)
+                    invoke('ssh_submit_tfa_code', { sessionId, code: tfaCodeInput }).catch(() => {})
                   }}
-                >{t('common.connect')}</button>
-                <button className="error-dialog-btn secondary" onClick={() => setTfaDialog(null)}>{t('common.cancel')}</button>
+                >{t('common.confirm')}</button>
+                <button className="error-dialog-btn secondary" onClick={() => { setTfaDialog(null); setTfaRetryHint(false) }}>{t('common.cancel')}</button>
               </div>
             </div>
           </div>
@@ -1173,7 +1164,6 @@ function App() {
               <div key={s.configId + s.sessionId} style={{ display: s.configId === activeConfigId ? 'block' : 'none', height: '100%' }}>
                 <ServerPanel
                   sessionId={s.sessionId}
-                  connId={s.configId}
                   connHost={s.hostKey}
                   connUsername={s.username}
                   initialSection={s.initialSection}

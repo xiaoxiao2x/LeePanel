@@ -43,7 +43,6 @@ interface AppSettings {
 
 interface ServerPanelProps {
   sessionId: string | null
-  connId?: string
   connHost?: string
   connUsername?: string
   initialSection?: string
@@ -83,7 +82,7 @@ const NAV_ITEMS: { key: PanelSection; labelKey: string; icon: string }[] = [
   { key: 'discussions', labelKey: 'nav.discussions', icon: '💬' },
 ]
 
-export default function ServerPanel({ sessionId, connId, connHost, connUsername, initialSection = 'dashboard', jumpToPath, setJumpToPath, termRef, onStartUpload, onUploadComplete, appSettings, onToggleAutoReconnect, onUpdateSettings, onShowToast }: ServerPanelProps) {
+export default function ServerPanel({ sessionId, connHost, connUsername, initialSection = 'dashboard', jumpToPath, setJumpToPath, termRef, onStartUpload, onUploadComplete, appSettings, onToggleAutoReconnect, onUpdateSettings, onShowToast }: ServerPanelProps) {
   const { t } = useTranslation()
   const [activeSection, setActiveSectionRaw] = useState<PanelSection>((initialSection && NAV_ITEMS.some(s => s.key === initialSection) ? initialSection : 'dashboard') as PanelSection)
   const cdHereRef = useRef<string | null>(null)
@@ -174,7 +173,7 @@ export default function ServerPanel({ sessionId, connId, connHost, connUsername,
       case 'port':
         return <PortPanel sessionId={sessionId} />
       case '2fa':
-        return <TwoFaPanel sessionId={sessionId} connId={connId} />
+        return <TwoFaPanel sessionId={sessionId} />
       // case 'software': removed - always mounted below
       case 'bbr':
         return <BbrPanel sessionId={sessionId} />

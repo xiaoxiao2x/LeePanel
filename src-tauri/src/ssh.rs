@@ -246,10 +246,6 @@ pub struct ConnectInfo {
     pub rows: u32,
     /// 权限模型 v8：'direct_root'（root 直连）/ 'sudo'（普通用户 + sudo）。
     pub auth_mode: String,
-    /// SSH 2FA（v9）：服务器已开启双因素 → 认证走 keyboard-interactive 统一流程。
-    pub tfa_enabled: bool,
-    /// 预填 TOTP 验证码（连接表单输入；认证循环中按需应答）。
-    pub tfa_code: Option<String>,
 }
 
 struct ChannelOpen {
@@ -310,13 +306,11 @@ impl SshManager {
         passphrase: Option<String>,
         auth_mode: String,
         sudo_password: Option<String>,
-        tfa_enabled: bool,
-        tfa_code: Option<String>,
         app_handle: AppHandle,
         cols: u32,
         rows: u32,
     ) -> Result<(), String> {
-        let session = Self::do_connect(session_id.clone(), host, port, username, password, key_path, passphrase, auth_mode, sudo_password, tfa_enabled, tfa_code, app_handle.clone(), cols, rows).await?;
+        let session = Self::do_connect(session_id.clone(), host, port, username, password, key_path, passphrase, auth_mode, sudo_password, app_handle.clone(), cols, rows).await?;
         self.sessions.write().unwrap().insert(session_id, session);
         Ok(())
     }
@@ -354,8 +348,6 @@ impl SshManager {
         passphrase: Option<String>,
         auth_mode: String,
         sudo_password: Option<String>,
-        tfa_enabled: bool,
-        tfa_code: Option<String>,
         app_handle: AppHandle,
         cols: u32,
         rows: u32,
@@ -400,80 +392,14 @@ impl SshManager {
         .map_err(|_| format!("SSH handshake timeout: {}:{}", host, port))?
         .map_err(|e| format!("Connection failed: {}", e))?;
 
-        // Authenticate
-        // SSH 2FA（v9）：服务器标记 tfa_enabled 时走 keyboard-interactive 统一流程。
-        // 背景：russh 的 authenticate_password 内部 wait_recv_reply 只认 Success/Failure，
-        // 服务器配 AuthenticationMethods password,keyboard-interactive 后密码通过会回
-        // AuthInfoRequest 而非 SUCCESS → 该路径会死等到握手超时。因此 2FA 服务器必须
-        // 显式走 keyboard-interactive 多轮问答（密码/验证码逐 prompt 应答）。
-        if tfa_enabled {
-            use russh::client::KeyboardInteractiveAuthResponse;
-            let mut response = sh
-                .authenticate_keyboard_interactive_start(&username, None::<String>)
-                .await
-                .map_err(|e| format!("2FA auth error: {}", e))?;
-            let mut attempts = 0u32;
-            // 记录最近一轮服务端 prompt，认证失败时附上便于诊断（如未知 prompt 导致空串应答）
-            let mut last_prompts: Vec<String> = Vec::new();
-            loop {
-                match response {
-                    KeyboardInteractiveAuthResponse::Success => break,
-                    KeyboardInteractiveAuthResponse::Failure => {
-                        let prompts_summary = if last_prompts.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" (server prompts: {})", last_prompts.join(" | "))
-                        };
-                        return Err(format!(
-                            "2FA auth failed: incorrect password or verification code{}",
-                            prompts_summary
-                        ));
-                    }
-                    KeyboardInteractiveAuthResponse::InfoRequest {
-                        name: _,
-                        instructions: _,
-                        prompts,
-                    } => {
-                        attempts += 1;
-                        if attempts > 8 {
-                            return Err("2FA auth failed: too many prompts from server".to_string());
-                        }
-                        last_prompts = prompts.iter().map(|p| p.prompt.clone()).collect();
-                        let mut answers: Vec<String> = Vec::with_capacity(prompts.len());
-                        for p in &prompts {
-                            let lower = p.prompt.to_lowercase();
-                            if lower.contains("password") || lower.contains("passcode") {
-                                match &password {
-                                    Some(pw) => answers.push(pw.clone()),
-                                    None => {
-                                        return Err("2FA auth requires a password but none was provided".to_string());
-                                    }
-                                }
-                            } else if lower.contains("verification")
-                                || lower.contains("code")
-                                || lower.contains("otp")
-                                || lower.contains("totp")
-                                || lower.contains("authenticator")
-                            {
-                                match &tfa_code {
-                                    Some(c) => answers.push(c.clone()),
-                                    None => {
-                                        return Err("2FA auth requires a verification code but none was provided".to_string());
-                                    }
-                                }
-                            } else {
-                                // 未知 prompt（echo=true 的空提示等）：应答空串
-                                answers.push(String::new());
-                            }
-                        }
-                        response = sh
-                            .authenticate_keyboard_interactive_respond(answers)
-                            .await
-                            .map_err(|e| format!("2FA auth respond error: {}", e))?;
-                    }
-                }
-            }
-        } else if let Some(ref kp) = key_path {
+        // Authenticate — 动态自适应（v10）：不再依赖本地 2FA 标记，由服务器决定。
+        // - 密钥用户：优先 publickey（普通服务器主路径）。2FA 服务器的 publickey→验证码
+        //   序列受 russh 限制（authenticate_publickey 遇 AuthInfoRequest 会死等），
+        //   此类服务器建议改用密码认证（走下方 keyboard-interactive 路径）。
+        // - 密码用户/无凭据：优先 keyboard-interactive——服务器开了 2FA 时 PAM 会额外问
+        //   验证码（经 'tfa-code-request' 事件弹窗动态收集）；未开 2FA 时只问密码，静默通过；
+        //   服务器禁用 keyboard-interactive 时回退 password。
+        if let Some(ref kp) = key_path {
             // Pre-check: if the key is passphrase-encrypted and no passphrase was provided,
             // fail fast with a clear message (instead of russh's raw "The key is encrypted")
             let key_encrypted = key_file_is_encrypted(kp)
@@ -495,18 +421,38 @@ impl SshManager {
             let auth_ok = sh.authenticate_publickey(&username, Arc::new(key))
                 .await
                 .map_err(|e| format!("Key auth error: {}", e))?;
-            if !auth_ok {
-                return Err("Key auth failed: server rejected the key".to_string());
-            }
-        } else if let Some(ref pw) = password {
-            let auth_ok = sh.authenticate_password(&username, pw)
-                .await
-                .map_err(|e| format!("Password auth error: {}", e))?;
-            if !auth_ok {
-                return Err("Password auth failed: incorrect password".to_string());
+            if auth_ok {
+                // 密钥认证完全成功（服务器未要求第二因素）
+            } else {
+                // 密钥未完全成功：2FA 服务器（AuthenticationMethods 要求第二因素，
+                // OpenSSH 回 partial-success，russh 表现为 false）或密钥被服务器拒绝。
+                // → 回退 keyboard-interactive：2FA 路径（publickey,keyboard-interactive）下
+                //   只问验证码，弹窗收集后完成认证；普通服务器密钥无效时才真正报错。
+                let ki_ok = try_keyboard_interactive_auth(
+                    &mut sh, &username, &password, &app_handle, &session_id,
+                ).await?;
+                if ki_ok.is_none() {
+                    return Err("Key auth failed: server rejected the key".to_string());
+                }
             }
         } else {
-            return Err("No authentication method provided".to_string());
+            // 优先 keyboard-interactive（自适应 2FA）
+            let ki_ok = try_keyboard_interactive_auth(
+                &mut sh, &username, &password, &app_handle, &session_id,
+            ).await?;
+            if ki_ok.is_none() {
+                // 服务器不支持 keyboard-interactive → 回退 password
+                if let Some(ref pw) = password {
+                    let auth_ok = sh.authenticate_password(&username, pw)
+                        .await
+                        .map_err(|e| format!("Password auth error: {}", e))?;
+                    if !auth_ok {
+                        return Err("Password auth failed: incorrect password".to_string());
+                    }
+                } else {
+                    return Err("No authentication method provided".to_string());
+                }
+            }
         }
 
         let mut channel = sh
@@ -598,8 +544,6 @@ impl SshManager {
             cols,
             rows,
             auth_mode: auth_mode.clone(),
-            tfa_enabled,
-            tfa_code: tfa_code.clone(),
         };
 
         let session = SshSession {
@@ -1520,8 +1464,6 @@ impl SshManager {
             info.passphrase,
             info.auth_mode,
             sudo_password,
-            info.tfa_enabled,
-            info.tfa_code,
             app_handle,
             info.cols,
             info.rows,
@@ -1533,6 +1475,110 @@ impl SshManager {
     }
 }
 
+/// 动态 2FA 认证（v10）：优先 keyboard-interactive，由服务器决定是否需要验证码。
+/// - 服务器要求验证码时：经 `tfa-code-request` 事件弹窗（TfaCodePending 模式，
+///   与 host key TOFU 相同）动态收集用户输入，无需本地标记预判。
+/// - 返回 Ok(None)：服务器不支持 keyboard-interactive（首次 start 即 Failure），调用方回退标准认证。
+/// - 返回 Ok(Some(()))：认证成功。
+/// - 收到 Failure（非首次）：密码/验证码错误 → **重新发起** keyboard-interactive（让 server
+///   重新询问并经 `tfa-code-request` 事件**再次弹出验证码输入框**），最多 5 次后放弃。
+async fn try_keyboard_interactive_auth(
+    sh: &mut client::Handle<SshHandler>,
+    username: &str,
+    password: &Option<String>,
+    app_handle: &AppHandle,
+    session_id: &str,
+) -> Result<Option<()>, String> {
+    use russh::client::KeyboardInteractiveAuthResponse;
+    const MAX_RETRIES: u32 = 5;
+    let mut retries: u32 = 0;
+    let mut is_retry = false;
+    let mut just_started = true;
+    let mut response = sh
+        .authenticate_keyboard_interactive_start(username, None::<String>)
+        .await
+        .map_err(|e| format!("2FA auth error: {}", e))?;
+    loop {
+        match response {
+            KeyboardInteractiveAuthResponse::Success => return Ok(Some(())),
+            KeyboardInteractiveAuthResponse::Failure => {
+                if just_started {
+                    // 首次 start 即 Failure → 服务器不支持 keyboard-interactive → 回退标准认证
+                    return Ok(None);
+                }
+                retries += 1;
+                if retries > MAX_RETRIES {
+                    return Err(format!(
+                        "2FA auth failed: too many attempts ({}), giving up",
+                        MAX_RETRIES
+                    ));
+                }
+                // 密码/验证码错误 → 重新发起整轮键盘交互，server 会再次询问并触发弹窗；
+                // is_retry 标记让前端在重新弹窗时提示"上次输入错误"
+                is_retry = true;
+                response = sh
+                    .authenticate_keyboard_interactive_start(username, None::<String>)
+                    .await
+                    .map_err(|e| format!("2FA auth error (retry {}): {}", retries, e))?;
+                just_started = true;
+            }
+            KeyboardInteractiveAuthResponse::InfoRequest {
+                name: _,
+                instructions: _,
+                prompts,
+            } => {
+                just_started = false;
+                let prompts_summary = prompts.iter().map(|p| p.prompt.clone()).collect::<Vec<_>>().join(" | ");
+                let mut answers: Vec<String> = Vec::with_capacity(prompts.len());
+                for p in &prompts {
+                    let lower = p.prompt.to_lowercase();
+                    if lower.contains("password") || lower.contains("passcode") {
+                        match password {
+                            Some(pw) => answers.push(pw.clone()),
+                            None => {
+                                return Err(format!(
+                                    "2FA auth requires a password but none was provided (server prompts: {})",
+                                    prompts_summary
+                                ));
+                            }
+                        }
+                    } else if lower.contains("verification")
+                        || lower.contains("code")
+                        || lower.contains("otp")
+                        || lower.contains("totp")
+                        || lower.contains("authenticator")
+                    {
+                        let code = request_tfa_code(app_handle, session_id, is_retry).await?;
+                        answers.push(code);
+                    } else {
+                        // 未知 prompt（echo=true 的空提示等）：应答空串
+                        answers.push(String::new());
+                    }
+                }
+                response = sh
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await
+                    .map_err(|e| format!("2FA auth respond error: {}", e))?;
+            }
+        }
+    }
+}
+
+/// 等待前端弹窗输入 TOTP 验证码（120s 超时；用户取消/超时视为认证失败）。
+/// `retry=true` 表示上一轮输入被服务器拒绝——前端弹窗展示"验证码错误，请重新输入"提示。
+async fn request_tfa_code(app_handle: &AppHandle, session_id: &str, retry: bool) -> Result<String, String> {
+    let pending = app_handle.state::<crate::TfaCodePending>();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    pending.lock().unwrap().insert(session_id.to_string(), tx);
+    let _ = app_handle.emit(
+        "tfa-code-request",
+        serde_json::json!({ "sessionId": session_id, "retry": retry }),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(120), rx)
+        .await
+        .map_err(|_| "Timed out waiting for verification code".to_string())?
+        .map_err(|_| "Verification code request cancelled".to_string())
+}
 
 pub async fn session_list_dir(session: &SshSession, path: &str) -> Result<String, String> {
     let sftp = session_open_sftp(session).await?;
