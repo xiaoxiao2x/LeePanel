@@ -296,9 +296,52 @@ pub fn init_db() -> Result<Mutex<SqliteConn>, String> {
         let _ = conn.execute_batch("ALTER TABLE connections ADD COLUMN tfa_type TEXT NOT NULL DEFAULT 'totp';");
     }
 
+    // v10: 移除本地 2FA 标记列（tfa_enabled/tfa_type）——2FA 改为"服务器动态判断"：
+    // 认证时由服务器决定是否要求验证码（keyboard-interactive 询问），不再需要本地预判。
+    // SQLite 删列需重建表（幂等：仅当列仍存在时执行）。
+    let v10_has_tfa: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('connections') WHERE name='tfa_enabled'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+    if v10_has_tfa {
+        let rebuild = r#"
+            ALTER TABLE connections RENAME TO connections_tfa_v10;
+            CREATE TABLE connections (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL DEFAULT 22,
+                username TEXT NOT NULL DEFAULT 'root',
+                auth_type TEXT NOT NULL DEFAULT 'password',
+                key_path TEXT,
+                password TEXT,
+                passphrase TEXT,
+                remember_me INTEGER DEFAULT 0,
+                has_password INTEGER DEFAULT 0,
+                has_passphrase INTEGER DEFAULT 0,
+                auth_mode TEXT NOT NULL DEFAULT 'direct_root',
+                sudo_password_mode TEXT NOT NULL DEFAULT 'ask',
+                has_sudo_password INTEGER DEFAULT 0
+            );
+            INSERT INTO connections (id, name, host, port, username, auth_type, key_path, password, passphrase, remember_me, has_password, has_passphrase, auth_mode, sudo_password_mode, has_sudo_password)
+            SELECT id, name, host, port, username, auth_type, key_path, password, passphrase, remember_me, has_password, has_passphrase, auth_mode, sudo_password_mode, has_sudo_password
+            FROM connections_tfa_v10;
+            DROP TABLE connections_tfa_v10;
+        "#;
+        if let Err(e) = conn.execute_batch(rebuild) {
+            // 重建失败（罕见）：回滚重命名为原始表名，保持数据可用
+            let _ = conn.execute_batch("ALTER TABLE connections_tfa_v10 RENAME TO connections;");
+            return Err(format!("Failed to migrate connections (drop tfa columns): {}", e));
+        }
+    }
+
     // Update schema version to latest
     conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES ('schema_version', '9')",
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('schema_version', '10')",
         [],
     ).map_err(|e| format!("Failed to update schema_version: {}", e))?;
 
