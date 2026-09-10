@@ -89,6 +89,19 @@ pub async fn ssh_submit_tfa_code(
         .map_err(|_| "Verification code request already closed".to_string())
 }
 
+/// 动态 2FA（v10）：用户在前端弹窗主动取消（点 × / 取消）时调用，
+/// drop pending sender 使 oneshot 立即返回 RecvError，请求方认证流程立即失败（不再等 120s 超时）。
+#[tauri::command]
+pub async fn ssh_cancel_tfa_code(
+    pending: tauri::State<'_, crate::TfaCodePending>,
+    session_id: String,
+) -> Result<(), String> {
+    if pending.lock().unwrap().remove(&session_id).is_none() {
+        return Err("No pending verification code request for this session".to_string());
+    }
+    Ok(())
+}
+
 /// 权限模型 v8：设置会话级 sudo 密码（ask 模式弹窗输入后调用）。
 /// `remember=true` 时同时写入系统钥匙串（需 config_id）。
 #[tauri::command]

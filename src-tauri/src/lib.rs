@@ -86,6 +86,7 @@ pub fn run() {
             commands::ssh::ssh_generate_keypair, commands::ssh::save_key_to_local,
             commands::ssh::ssh_confirm_host_key,
             commands::ssh::ssh_submit_tfa_code,
+            commands::ssh::ssh_cancel_tfa_code,
             commands::ssh::ssh_set_sudo_password, commands::ssh::ssh_generate_sudoers,
             // SSH 2FA（v9）
             commands::tfa::tfa_get_status, commands::tfa::tfa_install,

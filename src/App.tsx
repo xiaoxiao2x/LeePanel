@@ -939,6 +939,16 @@ function App() {
     return () => { unlisten.then(f => f()) }
   }, [])
 
+  // 主动取消 2FA 弹窗（× 或取消按钮）：通知后端立即失败（不再等 120s 超时）
+  const cancelTfaDialog = () => {
+    if (tfaDialog) {
+      invoke('ssh_cancel_tfa_code', { sessionId: tfaDialog.sessionId }).catch(() => {})
+    }
+    setTfaDialog(null)
+    setTfaRetryHint(false)
+    setTfaCodeInput('')
+  }
+
   return (
     <div className="app">
       {sidebarVisible && (
@@ -1034,11 +1044,12 @@ function App() {
           </div>
         )}
 
-        {/* SSH 2FA（v10）：认证中服务器要求验证码 → 动态弹窗 → ssh_submit_tfa_code 回传 */}
+        {/* SSH 2FA（v10）：认证中服务器要求验证码 → 动态弹窗 → ssh_submit_tfa_code 回传。
+            弹窗不可点遮罩关闭（避免误触），只能 × / 确认 / 取消 三种有意操作；取消立即通知后端失败。 */}
         {tfaDialog && (
-          <div className="error-dialog-overlay" onClick={() => { setTfaDialog(null); setTfaRetryHint(false) }}>
+          <div className="error-dialog-overlay">
             <div className="error-dialog" onClick={(e) => e.stopPropagation()}>
-              <button className="error-dialog-close" onClick={() => { setTfaDialog(null); setTfaRetryHint(false) }}>×</button>
+              <button className="error-dialog-close" onClick={() => cancelTfaDialog()}>×</button>
               <div className="error-dialog-icon">🔐</div>
               <div className="error-dialog-title">{t('tfa.codeRequired')}</div>
               {tfaRetryHint && (
@@ -1073,7 +1084,7 @@ function App() {
                     invoke('ssh_submit_tfa_code', { sessionId, code: tfaCodeInput }).catch(() => {})
                   }}
                 >{t('common.confirm')}</button>
-                <button className="error-dialog-btn secondary" onClick={() => { setTfaDialog(null); setTfaRetryHint(false) }}>{t('common.cancel')}</button>
+                <button className="error-dialog-btn secondary" onClick={cancelTfaDialog}>{t('common.cancel')}</button>
               </div>
             </div>
           </div>
