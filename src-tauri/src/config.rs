@@ -1,0 +1,456 @@
+use rusqlite::Connection as SqliteConn;
+use rusqlite::params;
+use serde::{Deserialize, Serialize};
+
+// ===== Connection =====
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Connection {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<String>,
+    /// 明文密码 —— 仅作为"新建/编辑表单提交"的输入；list() 永不返回明文。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// 明文密钥口令 —— 同上，仅作输入。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<String>,
+    /// 明文 sudo 密码 —— 仅作"保存表单"输入（权限模型 v8）；list() 永不返回明文。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sudo_password: Option<String>,
+    #[serde(default)]
+    pub remember_me: bool,
+    /// 标记：钥匙串中是否已保存对应凭据（list() 返回，供 UI 显示"已保存"状态）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_password: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_passphrase: Option<bool>,
+    /// 权限模型 v8：连接模式 —— 'direct_root'（root 直连，默认）/ 'sudo'（普通用户 + sudo）。
+    #[serde(default = "default_auth_mode")]
+    pub auth_mode: String,
+    /// sudo 密码策略 —— 'ask'（每次输入，默认）/ 'keyring'（保存钥匙串自动加载）。
+    #[serde(default = "default_sudo_password_mode")]
+    pub sudo_password_mode: String,
+    /// 标记：钥匙串中是否已保存 sudo 密码。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_sudo_password: Option<bool>,
+}
+
+fn default_auth_mode() -> String { "direct_root".to_string() }
+fn default_sudo_password_mode() -> String { "ask".to_string() }
+
+pub struct ConfigManager;
+
+impl ConfigManager {
+    pub fn list(conn: &SqliteConn) -> Vec<Connection> {
+        let mut stmt = conn
+            .prepare("SELECT id, name, host, port, username, auth_type, key_path, password, passphrase, remember_me, has_password, has_passphrase, COALESCE(auth_mode,'direct_root'), COALESCE(sudo_password_mode,'ask'), COALESCE(has_sudo_password,0) FROM connections ORDER BY name")
+            .expect("prepare connections list");
+        stmt.query_map([], |row| {
+            // 标记列优先（新数据）；明文列仅作迁移前旧数据兼容推导，永不返回明文
+            let db_password: Option<String> = row.get(7)?;
+            let db_passphrase: Option<String> = row.get(8)?;
+            let marker_password: Option<i64> = row.get(10)?;
+            let marker_passphrase: Option<i64> = row.get(11)?;
+            let has_password = marker_password.map(|v| v == 1).unwrap_or(false)
+                || db_password.as_deref().is_some_and(|p| !p.is_empty());
+            let has_passphrase = marker_passphrase.map(|v| v == 1).unwrap_or(false)
+                || db_passphrase.as_deref().is_some_and(|p| !p.is_empty());
+            Ok(Connection {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                host: row.get(2)?,
+                port: row.get::<_, i64>(3)? as u16,
+                username: row.get(4)?,
+                auth_type: row.get(5)?,
+                key_path: row.get(6)?,
+                password: None,
+                passphrase: None,
+                sudo_password: None,
+                remember_me: row.get::<_, Option<i64>>(9)?.map(|v| v == 1).unwrap_or(false),
+                has_password: Some(has_password),
+                has_passphrase: Some(has_passphrase),
+                auth_mode: row.get(12)?,
+                sudo_password_mode: row.get(13)?,
+                has_sudo_password: Some(row.get::<_, i64>(14)? == 1),
+            })
+        })
+        .expect("query connections")
+        .filter_map(|r| r.ok())
+        .collect()
+    }
+
+    pub fn save(conn: &SqliteConn, c: &Connection) -> Result<(), String> {
+        // 凭据明文字段仅作表单输入，绝不落库；落库的只有钥匙串存在性标记。
+        // INSERT OR REPLACE 同时把历史明文列清空为 NULL（配合 migrate_credentials 完成去明文）。
+        let remember_me = if c.remember_me { 1 } else { 0 };
+        let has_password = if c.has_password.unwrap_or(false) { 1 } else { 0 };
+        let has_passphrase = if c.has_passphrase.unwrap_or(false) { 1 } else { 0 };
+        let has_sudo_password = if c.has_sudo_password.unwrap_or(false) { 1 } else { 0 };
+        conn.execute(
+            "INSERT OR REPLACE INTO connections (id, name, host, port, username, auth_type, key_path, password, passphrase, remember_me, has_password, has_passphrase, auth_mode, sudo_password_mode, has_sudo_password) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![c.id, c.name, c.host, c.port as i64, c.username, c.auth_type, c.key_path, None::<String>, None::<String>, remember_me, has_password, has_passphrase, c.auth_mode, c.sudo_password_mode, has_sudo_password],
+        ).map_err(|e| format!("Save connection failed: {}", e))?;
+        Ok(())
+    }
+
+    pub fn delete(conn: &SqliteConn, id: &str) -> Result<(), String> {
+        conn.execute("DELETE FROM connections WHERE id = ?1", params![id])
+            .map_err(|e| format!("Delete connection failed: {}", e))?;
+        Ok(())
+    }
+
+    pub fn save_credentials(
+        conn: &SqliteConn,
+        id: &str,
+        username: &str,
+        auth_type: &str,
+        key_path: Option<&str>,
+        password: Option<&str>,
+        passphrase: Option<&str>,
+        remember_me: bool,
+    ) -> Result<(), String> {
+        // 明文参数仅用于推导钥匙串存在性标记；实际明文写入由 command 层（config_save_credentials）负责
+        let has_password = password.as_deref().is_some_and(|p| !p.is_empty());
+        let has_passphrase = passphrase.as_deref().is_some_and(|p| !p.is_empty());
+        let remember = if remember_me { 1 } else { 0 };
+        conn.execute(
+            "UPDATE connections SET username = ?1, auth_type = ?2, key_path = ?3, password = NULL, passphrase = NULL, remember_me = ?4, has_password = ?5, has_passphrase = ?6 WHERE id = ?7",
+            params![username, auth_type, key_path, remember, has_password, has_passphrase, id],
+        ).map_err(|e| format!("Save credentials failed: {}", e))?;
+        Ok(())
+    }
+}
+
+// ===== Favorite =====
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Favorite {
+    pub path: String,
+    pub name: String,
+}
+
+pub struct FavoritesManager;
+
+impl FavoritesManager {
+    pub fn list(conn: &SqliteConn) -> Vec<Favorite> {
+        let mut stmt = conn
+            .prepare("SELECT path, name FROM favorites ORDER BY name")
+            .expect("prepare favorites list");
+        stmt.query_map([], |row| {
+            Ok(Favorite {
+                path: row.get(0)?,
+                name: row.get(1)?,
+            })
+        })
+        .expect("query favorites")
+        .filter_map(|r| r.ok())
+        .collect()
+    }
+
+    pub fn add(conn: &SqliteConn, fav: &Favorite) -> Result<(), String> {
+        conn.execute(
+            "INSERT OR IGNORE INTO favorites (path, name) VALUES (?1, ?2)",
+            params![fav.path, fav.name],
+        ).map_err(|e| format!("Add favorite failed: {}", e))?;
+        Ok(())
+    }
+
+    pub fn remove(conn: &SqliteConn, path: &str) -> Result<(), String> {
+        conn.execute("DELETE FROM favorites WHERE path = ?1", params![path])
+            .map_err(|e| format!("Delete favorite failed: {}", e))?;
+        Ok(())
+    }
+}
+
+// ===== Settings =====
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Settings {
+    #[serde(default = "default_true")]
+    pub auto_reconnect: bool,
+    #[serde(default = "default_reconnect_interval")]
+    pub reconnect_interval: u32,
+    #[serde(default = "default_max_attempts")]
+    pub max_reconnect_attempts: u32,
+    // ponytail: when true, tab is removed on disconnect; when false, tab stays alive (greyed out)
+    #[serde(default)]
+    pub close_tab_on_disconnect: bool,
+    #[serde(default = "default_cache_ttl")]
+    pub cache_ttl_hours: u32,
+    #[serde(default = "default_cache_max_files")]
+    pub cache_max_files: u32,
+    #[serde(default = "default_true")]
+    pub cache_enabled: bool,
+    #[serde(default = "default_command_timeout")]
+    pub command_timeout_minutes: u32,
+    #[serde(default = "default_upload_workers")]
+    pub upload_workers: u32,
+    // ponytail: ui theme — 'dark' (default) or 'light'
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+fn default_true() -> bool { true }
+fn default_reconnect_interval() -> u32 { 5 }
+fn default_max_attempts() -> u32 { 10 }
+fn default_cache_ttl() -> u32 { 24 }
+fn default_cache_max_files() -> u32 { 500 }
+fn default_command_timeout() -> u32 { 30 }
+fn default_upload_workers() -> u32 { 3 }
+fn default_theme() -> String { "dark".to_string() }
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            auto_reconnect: true,
+            reconnect_interval: 5,
+            max_reconnect_attempts: 10,
+            close_tab_on_disconnect: false,
+            cache_ttl_hours: 24,
+            cache_max_files: 500,
+            cache_enabled: true,
+            command_timeout_minutes: 30,
+            upload_workers: 3,
+            theme: "dark".to_string(),
+        }
+    }
+}
+
+pub struct SettingsManager;
+
+impl SettingsManager {
+    pub fn load(conn: &SqliteConn) -> Settings {
+        let mut settings = Settings::default();
+
+        if let Ok(val) = Self::get(conn, "auto_reconnect") {
+            if let Ok(v) = val.parse::<bool>() { settings.auto_reconnect = v; }
+        }
+        if let Ok(val) = Self::get(conn, "reconnect_interval") {
+            if let Ok(v) = val.parse::<u32>() { settings.reconnect_interval = v; }
+        }
+        if let Ok(val) = Self::get(conn, "max_reconnect_attempts") {
+            if let Ok(v) = val.parse::<u32>() { settings.max_reconnect_attempts = v; }
+        }
+        if let Ok(val) = Self::get(conn, "close_tab_on_disconnect") {
+            if let Ok(v) = val.parse::<bool>() { settings.close_tab_on_disconnect = v; }
+        }
+        if let Ok(val) = Self::get(conn, "cache_ttl_hours") {
+            if let Ok(v) = val.parse::<u32>() { settings.cache_ttl_hours = v; }
+        }
+        if let Ok(val) = Self::get(conn, "cache_max_files") {
+            if let Ok(v) = val.parse::<u32>() { settings.cache_max_files = v; }
+        }
+        if let Ok(val) = Self::get(conn, "cache_enabled") {
+            if let Ok(v) = val.parse::<bool>() { settings.cache_enabled = v; }
+        }
+        if let Ok(val) = Self::get(conn, "command_timeout_minutes") {
+            if let Ok(v) = val.parse::<u32>() { settings.command_timeout_minutes = v; }
+        }
+        if let Ok(val) = Self::get(conn, "upload_workers") {
+            if let Ok(v) = val.parse::<u32>() { settings.upload_workers = v; }
+        }
+        if let Ok(val) = Self::get(conn, "theme") {
+            if val == "light" || val == "dark" { settings.theme = val; }
+        }
+
+        settings
+    }
+
+    pub fn save(conn: &SqliteConn, settings: &Settings) -> Result<(), String> {
+        Self::set(conn, "auto_reconnect", &settings.auto_reconnect.to_string())?;
+        Self::set(conn, "reconnect_interval", &settings.reconnect_interval.to_string())?;
+        Self::set(conn, "max_reconnect_attempts", &settings.max_reconnect_attempts.to_string())?;
+        Self::set(conn, "close_tab_on_disconnect", &settings.close_tab_on_disconnect.to_string())?;
+        Self::set(conn, "cache_ttl_hours", &settings.cache_ttl_hours.to_string())?;
+        Self::set(conn, "cache_max_files", &settings.cache_max_files.to_string())?;
+        Self::set(conn, "cache_enabled", &settings.cache_enabled.to_string())?;
+        Self::set(conn, "command_timeout_minutes", &settings.command_timeout_minutes.to_string())?;
+        Self::set(conn, "upload_workers", &settings.upload_workers.to_string())?;
+        Self::set(conn, "theme", &settings.theme)?;
+        Ok(())
+    }
+
+    fn get(conn: &SqliteConn, key: &str) -> Result<String, String> {
+        conn.query_row("SELECT value FROM settings WHERE key = ?1", params![key], |row| row.get(0))
+            .map_err(|e| format!("Get setting failed: {}", e))
+    }
+
+    fn set(conn: &SqliteConn, key: &str, value: &str) -> Result<(), String> {
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        ).map_err(|e| format!("Set setting failed: {}", e))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_conn() -> SqliteConn {
+        let conn = SqliteConn::open(":memory:").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE connections (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', host TEXT NOT NULL,
+                port INTEGER NOT NULL DEFAULT 22, username TEXT NOT NULL DEFAULT 'root',
+                auth_type TEXT NOT NULL DEFAULT 'password', key_path TEXT, password TEXT,
+                passphrase TEXT, remember_me INTEGER DEFAULT 0,
+                has_password INTEGER DEFAULT 0, has_passphrase INTEGER DEFAULT 0,
+                auth_mode TEXT NOT NULL DEFAULT 'direct_root',
+                sudo_password_mode TEXT NOT NULL DEFAULT 'ask',
+                has_sudo_password INTEGER DEFAULT 0
+            );
+            CREATE TABLE favorites (path TEXT PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+        ).unwrap();
+        conn
+    }
+
+    // ===== ConfigManager =====
+
+    #[test]
+    fn config_save_and_list() {
+        let conn = test_conn();
+        let c = Connection {
+            id: "1".into(), name: "My Server".into(), host: "1.2.3.4".into(),
+            port: 22, username: "root".into(), auth_type: "password".into(),
+            key_path: None, password: Some("pass".into()), passphrase: None, remember_me: false,
+            has_password: None, has_passphrase: None,
+            sudo_password: None, auth_mode: "direct_root".into(), sudo_password_mode: "ask".into(), has_sudo_password: None,
+
+        };
+        ConfigManager::save(&conn, &c).unwrap();
+        let list = ConfigManager::list(&conn);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].host, "1.2.3.4");
+        assert_eq!(list[0].name, "My Server");
+    }
+
+    #[test]
+    fn config_delete() {
+        let conn = test_conn();
+        let c = Connection {
+            id: "1".into(), name: "S".into(), host: "1.2.3.4".into(),
+            port: 22, username: "root".into(), auth_type: "password".into(),
+            key_path: None, password: None, passphrase: None, remember_me: false,
+            has_password: None, has_passphrase: None,
+            sudo_password: None, auth_mode: "direct_root".into(), sudo_password_mode: "ask".into(), has_sudo_password: None,
+
+        };
+        ConfigManager::save(&conn, &c).unwrap();
+        ConfigManager::delete(&conn, "1").unwrap();
+        assert!(ConfigManager::list(&conn).is_empty());
+    }
+
+    #[test]
+    fn config_remember_me_roundtrip() {
+        let conn = test_conn();
+        let c = Connection {
+            id: "1".into(), name: "S".into(), host: "1.2.3.4".into(),
+            port: 22, username: "root".into(), auth_type: "key".into(),
+            key_path: Some("/root/.ssh/id_rsa".into()), password: None, passphrase: Some("pp".into()), remember_me: true,
+            // save() 的 has_* 标记由 command 层（config_save）根据钥匙串状态计算后传入
+            has_password: Some(false), has_passphrase: Some(true),
+            sudo_password: None, auth_mode: "direct_root".into(), sudo_password_mode: "ask".into(), has_sudo_password: None,
+
+        };
+        ConfigManager::save(&conn, &c).unwrap();
+        let list = ConfigManager::list(&conn);
+        assert!(list[0].remember_me);
+        assert_eq!(list[0].key_path, Some("/root/.ssh/id_rsa".to_string()));
+        // list() 不返回明文，改用标记断言
+        assert_eq!(list[0].has_passphrase, Some(true));
+        assert_eq!(list[0].passphrase, None);
+    }
+
+    #[test]
+    fn config_save_credentials() {
+        let conn = test_conn();
+        let c = Connection {
+            id: "1".into(), name: "S".into(), host: "1.2.3.4".into(),
+            port: 22, username: "root".into(), auth_type: "password".into(),
+            key_path: None, password: None, passphrase: None, remember_me: false,
+            has_password: None, has_passphrase: None,
+            sudo_password: None, auth_mode: "direct_root".into(), sudo_password_mode: "ask".into(), has_sudo_password: None,
+
+        };
+        ConfigManager::save(&conn, &c).unwrap();
+        ConfigManager::save_credentials(&conn, "1", "admin", "key", Some("/key"), None, Some("pp"), true).unwrap();
+        let list = ConfigManager::list(&conn);
+        assert_eq!(list[0].username, "admin");
+        assert_eq!(list[0].auth_type, "key");
+        assert!(list[0].remember_me);
+        // list() 不返回明文，改用标记断言
+        assert_eq!(list[0].has_passphrase, Some(true));
+        assert_eq!(list[0].passphrase, None);
+    }
+
+    // ===== FavoritesManager =====
+
+    #[test]
+    fn favorites_add_and_list() {
+        let conn = test_conn();
+        FavoritesManager::add(&conn, &Favorite { path: "/home".into(), name: "Home".into() }).unwrap();
+        let list = FavoritesManager::list(&conn);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Home");
+    }
+
+    #[test]
+    fn favorites_remove() {
+        let conn = test_conn();
+        FavoritesManager::add(&conn, &Favorite { path: "/home".into(), name: "Home".into() }).unwrap();
+        FavoritesManager::remove(&conn, "/home").unwrap();
+        assert!(FavoritesManager::list(&conn).is_empty());
+    }
+
+    // ===== SettingsManager =====
+
+    #[test]
+    fn settings_load_defaults_when_empty() {
+        let conn = test_conn();
+        let s = SettingsManager::load(&conn);
+        assert!(s.auto_reconnect);
+        assert_eq!(s.reconnect_interval, 5);
+        assert_eq!(s.command_timeout_minutes, 30);
+        assert_eq!(s.upload_workers, 3);
+    }
+
+    #[test]
+    fn settings_save_and_load_roundtrip() {
+        let conn = test_conn();
+        let s = Settings {
+            auto_reconnect: false,
+            reconnect_interval: 10,
+            max_reconnect_attempts: 5,
+            close_tab_on_disconnect: true,
+            cache_ttl_hours: 48,
+            cache_max_files: 1000,
+            cache_enabled: false,
+            command_timeout_minutes: 60,
+            upload_workers: 5,
+            theme: "light".to_string(),
+        };
+        SettingsManager::save(&conn, &s).unwrap();
+        let loaded = SettingsManager::load(&conn);
+        assert!(!loaded.auto_reconnect);
+        assert_eq!(loaded.reconnect_interval, 10);
+        assert_eq!(loaded.cache_ttl_hours, 48);
+        assert_eq!(loaded.upload_workers, 5);
+        assert_eq!(loaded.theme, "light");
+    }
+
+    #[test]
+    fn settings_default_trait() {
+        let s = Settings::default();
+        assert!(s.auto_reconnect);
+        assert_eq!(s.cache_max_files, 500);
+    }
+}

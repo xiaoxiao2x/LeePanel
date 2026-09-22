@@ -1,0 +1,1356 @@
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { invoke } from './sudoPrompt'
+import { listen } from '@tauri-apps/api/event'
+import { check, type Update } from '@tauri-apps/plugin-updater'
+import { useTranslation } from 'react-i18next'
+import Sidebar from './components/Sidebar'
+import ServerPanel from './components/ServerPanel'
+import HostKeysDialog from './components/HostKeysDialog'
+import { SudoPasswordDialog } from './sudoPrompt'
+import type { TerminalHandle } from './components/Terminal'
+import './App.css'
+
+interface UploadItem {
+  file: File
+  fileName: string
+  remotePath: string
+  status: 'pending' | 'uploading' | 'done' | 'error' | 'stopped'
+  error?: string
+  retryCount?: number
+}
+
+interface UploadState {
+  queue: UploadItem[]
+  totalBytes: number
+  uploadedBytes: number
+  speed: number
+  active: boolean
+  paused: boolean
+  workers: number
+}
+
+interface SidebarConnection {
+  id: string
+  name: string
+  host: string
+  port: number
+  username: string
+  auth_type: string
+  key_path?: string
+  password?: string
+  passphrase?: string
+  remember_me?: boolean
+  // 标记：凭据是否已保存到系统钥匙串（config_list 返回，不返回明文）
+  has_password?: boolean
+  has_passphrase?: boolean
+  // 权限模型 v8：连接模式 + sudo 密码策略
+  auth_mode?: string
+  sudo_password_mode?: string
+  has_sudo_password?: boolean
+}
+
+interface Settings {
+  auto_reconnect: boolean
+  reconnect_interval: number
+  max_reconnect_attempts: number
+  close_tab_on_disconnect: boolean
+  cache_ttl_hours: number
+  cache_max_files: number
+  cache_enabled: boolean
+  command_timeout_minutes: number
+  upload_workers: number
+  theme: string
+}
+
+interface ActiveSession {
+  configId: string
+  sessionId: string
+  name: string
+  hostKey: string
+  username: string
+  initialSection: string
+}
+
+function App() {
+  const { t } = useTranslation()
+  // ponytail: multi-session — sessions array + active tab, backend already supports N concurrent SSH
+  const [sessions, setSessions] = useState<ActiveSession[]>([])
+  const [activeConfigId, setActiveConfigId] = useState<string | null>(null)
+  // ponytail: track which sessions have an active SSH connection (decoupled from tab existence)
+  const [connectedConfigIds, setConnectedConfigIds] = useState<Set<string>>(new Set())
+  const [connectingServerId, setConnectingServerId] = useState<string | null>(null)
+  const [error, setError] = useState('')
+  const [toast, setToast] = useState('')
+  const [showWelcome, setShowWelcome] = useState(false)
+  const termRefMap = useRef(new Map<string, TerminalHandle | null>())
+  const activeTermRef = useRef<TerminalHandle | null>(null)
+  const [errorDialog, setErrorDialog] = useState<{ visible: boolean; type: 'auth' | 'network' | 'connection' | 'key' | 'hostKey' | 'hostKeyChanged' | 'other'; messageKey?: string; params?: Record<string, string>; message?: string } | null>(null)
+  // SSH 2FA（v10）：认证中服务器要求验证码 → 后端发 'tfa-code-request' 事件 → 动态弹窗收集
+  const [tfaDialog, setTfaDialog] = useState<{ sessionId: string } | null>(null)
+  const [tfaCodeInput, setTfaCodeInput] = useState('')
+  // 重新弹窗时提示"上次输入错误"（后端重试时 retry=true）
+  const [tfaRetryHint, setTfaRetryHint] = useState(false)
+  const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null)
+  // TOFU host-key verification (first-contact confirmation / key-changed warning)
+  const [hostKeyPrompt, setHostKeyPrompt] = useState<{ sessionId: string; host: string; port: number; keyType: string; fingerprint: string } | null>(null)
+  const [hostKeyChangedWarn, setHostKeyChangedWarn] = useState<{ host: string; port: number; keyType: string; fingerprint: string } | null>(null)
+  const [showHostKeysDialog, setShowHostKeysDialog] = useState(false)
+  // Set when the host-key-changed warning is shown — suppress the generic error dialog for the same failure
+  const hostKeyChangedHandledRef = useRef(false)
+
+  // Settings
+  const [settings, setSettings] = useState<Settings>({
+    auto_reconnect: true, reconnect_interval: 5, max_reconnect_attempts: 10, close_tab_on_disconnect: false, cache_ttl_hours: 24, cache_max_files: 500, cache_enabled: true, command_timeout_minutes: 30, upload_workers: 3, theme: 'dark'
+  })
+
+  // Apply theme to <html data-theme> whenever it changes (also covers initial load)
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', settings.theme || 'dark')
+  }, [settings.theme])
+  // ponytail: per-session reconnect state — each server reconnects independently
+  // ponytail: Map value stores { name, attempt } so the reconnect bar renders without toast flicker
+  const [reconnectingSessions, setReconnectingSessions] = useState<Map<string, { name: string; attempt: number }>>(new Map())
+  const reconnectingActiveRef = useRef(new Map<string, boolean>())
+  const reconnectAttemptRef = useRef(new Map<string, number>())
+  const autoReconnectRef = useRef(true)
+  // ponytail: ref for close_tab_on_disconnect to avoid stale closures in useEffect handlers
+  const closeTabOnDisconnectRef = useRef(false)
+  const manualDisconnectRef = useRef(false)
+  // ponytail: session-scoped passphrase fallback (configId -> passphrase). Passphrases are
+  // persisted to SQLite when remember_me is on; this cache only covers in-session edits that
+  // haven't been saved yet (e.g. fresh create/edit then immediate connect)
+  const passphraseCacheRef = useRef(new Map<string, string>())
+  // ponytail: sessions that initiated normal reboot — skip auto-reconnect on disconnect
+  const normalRebootSessionsRef = useRef(new Set<string>())
+  const [sidebarRefreshKey, setSidebarRefreshKey] = useState(0)
+
+  const activeSession = sessions.find(s => s.configId === activeConfigId) || null
+  const activeSessionId = activeSession?.sessionId ?? null
+  // ponytail: active tab disconnected and not reconnecting → show persistent toast
+  const isDisconnected = activeConfigId
+    ? !connectedConfigIds.has(activeConfigId) && !reconnectingSessions.has(activeConfigId)
+    : false
+
+  // ponytail: mark session as disconnected — keeps tab alive, only removes SSH connection state
+  const markDisconnected = (configId: string) => {
+    setConnectedConfigIds(prev => { const s = new Set(prev); s.delete(configId); return s })
+  }
+
+  // ponytail: disconnect action — remove tab or just mark disconnected based on user setting
+  const handleDisconnectAction = (configId: string) => {
+    if (closeTabOnDisconnectRef.current) removeSession(configId)
+    else markDisconnected(configId)
+  }
+
+  const removeSession = (configId: string) => {
+    termRefMap.current.delete(configId)
+    setSessions(prev => prev.filter(s => s.configId !== configId))
+    // ponytail: always clean connectedConfigIds — fixes sidebar showing Disconnect after tab removal
+    setConnectedConfigIds(prev => { const s = new Set(prev); s.delete(configId); return s })
+    setActiveConfigId(prev => {
+      if (prev !== configId) return prev
+      const rest = sessions.filter(s => s.configId !== configId)
+      return rest.length > 0 ? rest[rest.length - 1].configId : null
+    })
+  }
+
+  // ponytail: sync activeTermRef when switching tabs
+  useEffect(() => {
+    activeTermRef.current = activeConfigId ? (termRefMap.current.get(activeConfigId) ?? null) : null
+  }, [activeConfigId])
+
+  // Draggable dividers
+  const [sidebarWidth, setSidebarWidth] = useState(240)
+  const [sidebarVisible, setSidebarVisible] = useState(true)
+  const draggingRef = useRef<'sidebar' | null>(null)
+  const splitContainerRef = useRef<HTMLDivElement>(null)
+  // Listen for disconnect request from Sidebar (per-session)
+  useEffect(() => {
+    const handleDisconnectRequest = (e: Event) => {
+      const configId = (e as CustomEvent).detail?.configId
+      const sess = sessions.find(s => s.configId === configId)
+      if (!sess) return
+      manualDisconnectRef.current = true
+      const doRemove = () => {
+        termRefMap.current.get(configId)?.clear()
+        handleDisconnectAction(configId)
+      }
+      // ponytail: race disconnect against 3s local timeout — ensures UI always responds
+      Promise.race([
+        invoke('ssh_disconnect', { sessionId: sess.sessionId }).catch(() => {}),
+        new Promise<void>(resolve => setTimeout(resolve, 3000)),
+      ]).then(doRemove)
+    }
+    window.addEventListener('sidebar-disconnect', handleDisconnectRequest)
+    return () => window.removeEventListener('sidebar-disconnect', handleDisconnectRequest)
+  }, [sessions])
+
+  // Upload queue state
+  const [upload, setUpload] = useState<UploadState>({
+    queue: [], totalBytes: 0, uploadedBytes: 0, speed: 0, active: false, paused: false, workers: 0
+  })
+  const uploadPauseRef = useRef(false)
+  const uploadStopRef = useRef(false)
+  const uploadCompleteRef = useRef<(() => void) | null>(null)
+
+  // ponytail: build a POSIX tar archive in the browser — no dependencies
+  const createTar = async (entries: { name: string; file: File }[]): Promise<Uint8Array> => {
+    const chunks: Uint8Array[] = []
+    for (const { name, file } of entries) {
+      const data = new Uint8Array(await file.arrayBuffer())
+      const header = new Uint8Array(512)
+      const enc = new TextEncoder()
+      header.set(enc.encode(name), 0)
+      header.set(enc.encode('0000644\0'), 100)  // mode
+      header.set(enc.encode('0001000\0'), 108)  // uid
+      header.set(enc.encode('0001000\0'), 116)  // gid
+      header.set(enc.encode(file.size.toString(8).padStart(11, '0') + '\0'), 124)
+      header.set(enc.encode(Math.floor(Date.now() / 1000).toString(8).padStart(11, '0') + '\0'), 136)
+      header.set(enc.encode('        '), 148) // checksum placeholder (spaces)
+      header[156] = 0x30 // type '0' = regular file
+      header.set(enc.encode('ustar\0'), 257)
+      header.set(enc.encode('00'), 263)
+      // compute checksum
+      let cksum = 0
+      for (let i = 0; i < 512; i++) cksum += header[i]
+      header.set(enc.encode(cksum.toString(8).padStart(6, '0') + '\0 '), 148)
+      chunks.push(header)
+      chunks.push(data)
+      const padLen = (512 - (data.length % 512)) % 512
+      if (padLen > 0) chunks.push(new Uint8Array(padLen))
+    }
+    chunks.push(new Uint8Array(1024)) // terminator
+    const total = chunks.reduce((s, c) => s + c.length, 0)
+    const result = new Uint8Array(total)
+    let off = 0
+    for (const c of chunks) { result.set(c, off); off += c.length }
+    return result
+  }
+
+  const handleStartUpload = useCallback(async (files: { file: File; fileName: string; remotePath: string }[]) => {
+    if (!activeSessionId || files.length === 0) return
+    const sid = activeSessionId
+    const totalBytes = files.reduce((sum, f) => sum + f.file.size, 0)
+    const retryCounts = new Map<string, number>()
+    const queue: UploadItem[] = files.map(f => ({ ...f, status: 'pending' as const, retryCount: 0 }))
+    setUpload({ queue, totalBytes, uploadedBytes: 0, speed: 0, active: true, paused: false, workers: 0 })
+    uploadPauseRef.current = false
+    uploadStopRef.current = false
+
+    let uploadedBytes = 0
+    let activeWorkers = 0
+    const startTime = Date.now()
+    const CHUNK_SIZE = 1024 * 1024
+    // ponytail: files < 1MB go to tar batch; large files use chunked workers
+    const SMALL_THRESHOLD = CHUNK_SIZE
+
+    const updateSpeed = () => {
+      const elapsed = (Date.now() - startTime) / 1000
+      const speed = elapsed > 0 ? uploadedBytes / elapsed : 0
+      setUpload(prev => ({ ...prev, uploadedBytes, speed, workers: activeWorkers }))
+    }
+
+    // ponytail: batch small files by parent directory into tar archives — N SFTP ops → 1 per dir
+    // ponytail: single file always uses chunked upload; tar batch only for 2+ small files
+    const smallFiles: typeof files = []
+    const largeFiles: typeof files = []
+    for (const f of files) {
+      if (f.file.size < SMALL_THRESHOLD && f.file.size > 0) smallFiles.push(f)
+      else largeFiles.push(f)
+    }
+    if (smallFiles.length === 1) {
+      largeFiles.push(...smallFiles)
+      smallFiles.length = 0
+    }
+
+    if (smallFiles.length > 1) {
+      // group by parent directory
+      const byDir = new Map<string, typeof files>()
+      for (const f of smallFiles) {
+        const parent = f.remotePath.substring(0, f.remotePath.lastIndexOf('/'))
+        if (!byDir.has(parent)) byDir.set(parent, [])
+        byDir.get(parent)!.push(f)
+      }
+
+      // process directories with concurrency of 3
+      const dirEntries = [...byDir.entries()]
+      let dirIdx = 0
+      const batchWorker = async () => {
+        activeWorkers++
+        updateSpeed()
+        try {
+        while (dirIdx < dirEntries.length) {
+          if (uploadStopRef.current) return
+          const i = dirIdx++
+          const [parentDir, dirFiles] = dirEntries[i]
+
+          // mark batch as uploading
+          const indices = dirFiles.map(df => queue.indexOf(queue.find(q => q.remotePath === df.remotePath)!))
+          setUpload(prev => ({
+            ...prev,
+            queue: prev.queue.map((q, j) => indices.includes(j) ? { ...q, status: 'uploading' } : q)
+          }))
+
+          try {
+            const tarEntries = dirFiles.map(f => ({
+              name: f.fileName.split('/').pop()!, // just filename, extract in target dir
+              file: f.file,
+            }))
+            const tarData = await createTar(tarEntries)
+            const tarPath = `${parentDir}/.__tb_${Date.now()}_${i}.tar`
+
+            // upload tar in chunks
+            let offset = 0
+            while (offset < tarData.length) {
+              if (uploadStopRef.current) return
+              const end = Math.min(offset + CHUNK_SIZE, tarData.length)
+              const chunk = tarData.slice(offset, end)
+              await invoke('ssh_upload_chunk', {
+                sessionId: sid, remotePath: tarPath, data: chunk, offset,
+              })
+              uploadedBytes += (end - offset)
+              offset = end
+              updateSpeed()
+            }
+
+            // extract + cleanup
+            const escaped = (s: string) => s.replace(/'/g, "'\\''")
+            const cmd = `cd '${escaped(parentDir)}' && tar xf '${escaped(tarPath.split('/').pop()!)}' && rm -f '${escaped(tarPath.split('/').pop()!)}'`
+            const result = await invoke<[string, string, number]>('ssh_exec', { sessionId: sid, command: cmd })
+            if (result[2] !== 0) throw new Error(`tar extract failed: ${result[1]}`)
+
+            setUpload(prev => ({
+              ...prev,
+              queue: prev.queue.map((q, j) => indices.includes(j) ? { ...q, status: 'done' } : q)
+            }))
+          } catch (err) {
+            if (uploadStopRef.current) return
+            // ponytail: auto-retry up to 3 times per file before marking error
+            const canRetry = dirFiles.every(f => (retryCounts.get(f.remotePath) || 0) < 3)
+            if (canRetry) {
+              dirFiles.forEach(f => retryCounts.set(f.remotePath, (retryCounts.get(f.remotePath) || 0) + 1))
+              await invoke('ssh_sftp_reset', { sessionId: sid }).catch(() => {})
+              await new Promise(r => setTimeout(r, 1000))
+              if (uploadStopRef.current) return
+              setUpload(prev => ({
+                ...prev,
+                queue: prev.queue.map((q, j) => indices.includes(j) ? { ...q, status: 'pending' as const, retryCount: retryCounts.get(q.remotePath) || 0 } : q)
+              }))
+              dirEntries.push([parentDir, dirFiles])
+            } else {
+              setUpload(prev => ({
+                ...prev,
+                queue: prev.queue.map((q, j) => indices.includes(j) ? { ...q, status: 'error', error: String(err), retryCount: retryCounts.get(q.remotePath) || 0 } : q)
+              }))
+            }
+          }
+        }
+        } finally { activeWorkers--; updateSpeed() }
+      }
+      const batchWorkers = Array.from({ length: Math.min(settings.upload_workers || 3, dirEntries.length) }, () => batchWorker())
+      await Promise.all(batchWorkers)
+    }
+
+    if (uploadStopRef.current) return
+
+    // ponytail: large files + zero-byte files via chunked workers
+    const largeQueue: UploadItem[] = largeFiles.map(f => ({ ...f, status: 'pending' as const }))
+    if (largeQueue.length > 0) {
+      // update main queue to reflect only large files remaining
+      setUpload(prev => ({
+        ...prev,
+        queue: prev.queue.map(q => {
+          const inLarge = largeFiles.some(lf => lf.remotePath === q.remotePath)
+          return inLarge ? { ...q, status: 'pending' as const } : q
+        })
+      }))
+
+      const CONCURRENCY = Math.min(settings.upload_workers || 3, largeQueue.length)
+      let nextIndex = 0
+
+      const worker = async () => {
+        activeWorkers++
+        updateSpeed()
+        try {
+        while (true) {
+          if (uploadStopRef.current) return
+          const i = nextIndex++
+          if (i >= largeQueue.length) return
+          const item = largeQueue[i]
+
+          setUpload(prev => ({
+            ...prev,
+            queue: prev.queue.map(q => q.remotePath === item.remotePath ? { ...q, status: 'uploading' } : q)
+          }))
+
+          try {
+            let offset = 0
+            while (offset < item.file.size) {
+              if (uploadStopRef.current) return
+              while (uploadPauseRef.current) {
+                if (uploadStopRef.current) return
+                await new Promise(r => setTimeout(r, 100))
+              }
+
+              const end = Math.min(offset + CHUNK_SIZE, item.file.size)
+              const slice = item.file.slice(offset, end)
+              const buffer = await slice.arrayBuffer()
+              const chunkData = new Uint8Array(buffer)
+              try {
+                await invoke('ssh_upload_chunk', {
+                  sessionId: sid,
+                  remotePath: item.remotePath,
+                  data: chunkData,
+                  offset,
+                })
+              } catch (_chunkErr) {
+                if (uploadStopRef.current) return
+                await invoke('ssh_sftp_reset', { sessionId: sid }).catch(() => {})
+                await new Promise(r => setTimeout(r, 500))
+                if (uploadStopRef.current) return
+                await invoke('ssh_upload_chunk', {
+                  sessionId: sid,
+                  remotePath: item.remotePath,
+                  data: chunkData,
+                  offset,
+                })
+              }
+              uploadedBytes += (end - offset)
+              offset = end
+              updateSpeed()
+            }
+            setUpload(prev => ({
+              ...prev,
+              queue: prev.queue.map(q => q.remotePath === item.remotePath ? { ...q, status: 'done' } : q)
+            }))
+          } catch (err) {
+            if (uploadStopRef.current) return
+            // ponytail: auto-retry up to 3 times before marking error
+            const count = (retryCounts.get(item.remotePath) || 0) + 1
+            retryCounts.set(item.remotePath, count)
+            if (count < 3) {
+              await invoke('ssh_sftp_reset', { sessionId: sid }).catch(() => {})
+              await new Promise(r => setTimeout(r, 1000))
+              if (uploadStopRef.current) return
+              setUpload(prev => ({
+                ...prev,
+                queue: prev.queue.map(q => q.remotePath === item.remotePath ? { ...q, status: 'pending' as const, retryCount: count } : q)
+              }))
+              largeQueue.push(item)
+            } else {
+              setUpload(prev => ({
+                ...prev,
+                queue: prev.queue.map(q => q.remotePath === item.remotePath ? { ...q, status: 'error', error: String(err), retryCount: count } : q)
+              }))
+            }
+          }
+        }
+        } finally { activeWorkers--; updateSpeed() }
+      }
+
+      const workers = Array.from({ length: CONCURRENCY }, () => worker())
+      await Promise.all(workers)
+    }
+
+    if (!uploadStopRef.current) {
+      setUpload(prev => ({ ...prev, active: false, paused: false }))
+      uploadCompleteRef.current?.()
+    }
+  }, [activeSessionId, settings.upload_workers])
+
+  const handlePauseUpload = useCallback(() => {
+    uploadPauseRef.current = true
+    setUpload(prev => ({ ...prev, paused: true }))
+  }, [])
+
+  const handleResumeUpload = useCallback(() => {
+    uploadPauseRef.current = false
+    setUpload(prev => ({ ...prev, paused: false }))
+  }, [])
+
+  // ponytail: stop = immediately clear UI + signal workers to exit silently
+  const handleStopUpload = useCallback(() => {
+    uploadStopRef.current = true
+    uploadPauseRef.current = false
+    setUpload({ queue: [], totalBytes: 0, uploadedBytes: 0, speed: 0, active: false, paused: false, workers: 0 })
+  }, [])
+
+  const handleDismissUpload = useCallback(() => {
+    if (upload.active) return
+    setUpload({ queue: [], totalBytes: 0, uploadedBytes: 0, speed: 0, active: false, paused: false, workers: 0 })
+  }, [upload.active])
+
+  // ponytail: retry only failed files — re-queues them through the same upload pipeline
+  const handleRetryFailed = useCallback(() => {
+    const failed = upload.queue.filter(q => q.status === 'error')
+    if (failed.length === 0) return
+    handleStartUpload(failed.map(f => ({ file: f.file, fileName: f.fileName, remotePath: f.remotePath })))
+    // handleStartUpload creates a fresh retryCounts map, so retries reset to 0
+  }, [upload.queue, handleStartUpload])
+
+  const [jumpToPath, setJumpToPath] = useState<string | null>(null)
+
+  const handleCreateConnection = async (data: { name: string; host: string; port: number; username: string; auth_type: string; key_path?: string; password?: string; passphrase?: string; remember_me?: boolean }) => {
+    // Save the new connection
+    // 权限模型修复：id 用 crypto.randomUUID()（原 Date.now() 同毫秒创建会碰撞，
+    // 导致两个连接共用同一 configId、tab/session 互相覆盖）
+    const newId = crypto.randomUUID()
+    await invoke('config_save', {
+      connection: {
+        id: newId,
+        name: data.name,
+        host: data.host,
+        port: data.port,
+        username: data.username,
+        auth_type: data.auth_type,
+        key_path: data.key_path,
+        password: data.password,
+        passphrase: data.passphrase,
+        remember_me: data.remember_me || false,
+      },
+    })
+    // Keep passphrase in session memory (not persisted) so immediate connect works
+    if (data.passphrase) passphraseCacheRef.current.set(newId, data.passphrase)
+    setSidebarRefreshKey(k => k + 1)
+  }
+
+  const handleUpdateSettings = async (updates: Partial<Settings>) => {
+    const newSettings = { ...settings, ...updates }
+    setSettings(newSettings)
+    autoReconnectRef.current = newSettings.auto_reconnect
+    closeTabOnDisconnectRef.current = newSettings.close_tab_on_disconnect
+    await invoke('settings_save', { settings: newSettings }).catch(() => {})
+  }
+
+
+  useEffect(() => {
+    const onMouseMove = (e: MouseEvent) => {
+      if (draggingRef.current === 'sidebar') {
+        const w = Math.max(150, Math.min(500, e.clientX))
+        setSidebarWidth(w)
+      }
+    }
+    const onMouseUp = () => {
+      if (draggingRef.current) {
+        draggingRef.current = null
+        document.body.style.cursor = ''
+        document.body.style.userSelect = ''
+      }
+    }
+    window.addEventListener('mousemove', onMouseMove)
+    window.addEventListener('mouseup', onMouseUp)
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove)
+      window.removeEventListener('mouseup', onMouseUp)
+    }
+  }, [])
+
+  const startDrag = (type: 'sidebar') => {
+    draggingRef.current = type
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+  }
+
+  // Load settings on mount
+  useEffect(() => {
+    invoke<Settings>('settings_load').then(s => {
+      setSettings(s)
+      autoReconnectRef.current = s.auto_reconnect
+      closeTabOnDisconnectRef.current = s.close_tab_on_disconnect ?? false
+      closeTabOnDisconnectRef.current = s.close_tab_on_disconnect ?? false
+    }).catch(() => {})
+    // 探测系统钥匙串可用性：不可用时降级提示（凭据仅存本次会话）
+    invoke<boolean>('credential_available').then(ok => {
+      if (!ok) showToast(t('common.keyringUnavailable'))
+      else {
+        // 首次迁移提示：历史明文凭据已搬入系统钥匙串（仅提示一次，用 localStorage 去重）
+        try {
+          if (!localStorage.getItem('leepanel_cred_migration_notified')) {
+            invoke<number>('credential_migration_count').then(n => {
+              if (n > 0) {
+                localStorage.setItem('leepanel_cred_migration_notified', '1')
+                showToast(t('common.credentialsMigrated', { count: String(n) }))
+              }
+            }).catch(() => {})
+          }
+        } catch { /* localStorage 不可用时静默跳过 */ }
+      }
+    }).catch(() => {})
+    // ponytail: auto-check for updates on startup, ask user before downloading
+    Promise.race([
+      check(),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timeout')), 15000)),
+    ]).then(async update => {
+      if (update?.available) {
+        const { ask } = await import('@tauri-apps/plugin-dialog')
+        const yes = await ask(`New version ${update.version} available. Update now?`, { title: 'Update Available', kind: 'info' })
+        if (yes) {
+          showToast(`Downloading v${update.version}...`)
+          try {
+            await update.download()
+            const restart = await ask(`v${update.version} has been downloaded. Restart now to apply the update?`, { title: 'Update Ready', kind: 'info' })
+            if (restart) {
+              await update.install()
+            } else {
+              setPendingUpdate(update)
+              showToast('Update ready. Click "Restart Now" when you are ready.')
+            }
+          } catch (e) {
+            showToast(`Update failed: ${String(e).slice(0, 80)}`)
+          }
+        }
+      }
+    }).catch(() => {})
+  }, [])
+
+  const toggleAutoReconnect = async () => {
+    const newSettings = { ...settings, auto_reconnect: !settings.auto_reconnect }
+    setSettings(newSettings)
+    autoReconnectRef.current = newSettings.auto_reconnect
+    closeTabOnDisconnectRef.current = newSettings.close_tab_on_disconnect
+    await invoke('settings_save', { settings: newSettings }).catch(() => {})
+  }
+
+  useEffect(() => {
+    // Keep refs in sync
+    autoReconnectRef.current = settings.auto_reconnect
+    closeTabOnDisconnectRef.current = settings.close_tab_on_disconnect
+  }, [settings.auto_reconnect, settings.close_tab_on_disconnect])
+
+  // Listen for ssh-disconnected event (per-session)
+  useEffect(() => {
+    const unlisten = listen<{ sessionId: string; reason: string }>('ssh-disconnected', async (event) => {
+      const sid = event.payload.sessionId
+      const sess = sessions.find(s => s.sessionId === sid)
+      if (!sess) return
+      // Skip auto-reconnect if user manually disconnected
+      if (manualDisconnectRef.current) {
+        handleDisconnectAction(sess.configId)
+        return
+      }
+      // ponytail: skip auto-reconnect after normal (graceful) reboot
+      if (normalRebootSessionsRef.current.has(sess.sessionId)) {
+        normalRebootSessionsRef.current.delete(sess.sessionId)
+        showToast(`ℹ [${sess.name}] ${t('common.normalRebootHint')}`)
+        handleDisconnectAction(sess.configId)
+        return
+      }
+      if (sid && autoReconnectRef.current && !reconnectingActiveRef.current.get(sess.configId)) {
+        reconnectingActiveRef.current.set(sess.configId, true)
+        reconnectAttemptRef.current.set(sess.configId, 0)
+        setReconnectingSessions(prev => new Map(prev).set(sess.configId, { name: sess.name, attempt: 0 }))
+
+        const attemptReconnect = async () => {
+          if (!reconnectingActiveRef.current.get(sess.configId)) return
+          // ponytail: use ref for attempt count — state is stale in recursive async closures
+          const attempt = (reconnectAttemptRef.current.get(sess.configId) ?? 0) + 1
+          reconnectAttemptRef.current.set(sess.configId, attempt)
+          setReconnectingSessions(prev => new Map(prev).set(sess.configId, { name: sess.name, attempt }))
+          if (attempt > settings.max_reconnect_attempts) {
+            showToast(`✗ [${sess.name}] ${t('common.reconnectFailed', { max: settings.max_reconnect_attempts })}`)
+            reconnectingActiveRef.current.delete(sess.configId)
+            reconnectAttemptRef.current.delete(sess.configId)
+            setReconnectingSessions(prev => { const m = new Map(prev); m.delete(sess.configId); return m })
+            handleDisconnectAction(sess.configId)
+            return
+          }
+          try {
+            await invoke('ssh_reconnect', { sessionId: sid })
+            showToast(`✓ [${sess.name}] ${t('common.reconnectSuccess', { attempt })}`)
+            reconnectingActiveRef.current.delete(sess.configId)
+            reconnectAttemptRef.current.delete(sess.configId)
+            setReconnectingSessions(prev => { const m = new Map(prev); m.delete(sess.configId); return m })
+          } catch {
+            // ponytail: no showToast here — reconnect bar renders from state, no flicker
+            setTimeout(attemptReconnect, settings.reconnect_interval * 1000)
+          }
+        }
+        setTimeout(attemptReconnect, settings.reconnect_interval * 1000)
+      } else if (!autoReconnectRef.current) {
+        showToast(`⚠ [${sess.name}] ${t('common.connectionLost')}`)
+        handleDisconnectAction(sess.configId)
+      }
+    })
+    return () => { unlisten.then((fn) => fn()) }
+  }, [settings, sessions]) // eslint-disable-line
+
+  useEffect(() => {
+    const unlisten = listen<string>('ssh-closed', (event) => {
+      const sess = sessions.find(s => s.sessionId === event.payload)
+      if (sess) handleDisconnectAction(sess.configId)
+    })
+    return () => { unlisten.then((fn) => fn()) }
+  }, [sessions])
+
+  // ponytail: listen for normal-reboot event from ServerSettingsPanel
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const sid = (e as CustomEvent<{ sessionId: string }>).detail?.sessionId
+      if (sid) normalRebootSessionsRef.current.add(sid)
+    }
+    window.addEventListener('normal-reboot', handler)
+    return () => window.removeEventListener('normal-reboot', handler)
+  }, [])
+
+  const showToast = (msg: string) => {
+    setToast(msg)
+    setTimeout(() => setToast(''), 4000)
+  }
+
+  // Disconnect SSH session after LNMP installation (environment changes require fresh session)
+
+  const classifyError = (errorMsg: string): { type: 'auth' | 'network' | 'connection' | 'key' | 'hostKey' | 'hostKeyChanged' | 'other'; messageKey?: string; params?: Record<string, string>; message?: string } => {
+    const s = errorMsg.toLowerCase()
+    
+    // Host key verification errors (TOFU known_hosts)
+    // russh returns "Unknown server key" when check_server_key rejects the key
+    // (first-contact user rejection, or key change — the latter also emits a dedicated event)
+    if (s.includes('unknown server key')) {
+      return { type: 'hostKey', messageKey: 'errorDialog.hostKeyRejected' }
+    }
+    if (s.includes('host key') && (s.includes('changed') || s.includes('mismatch'))) {
+      return { type: 'hostKeyChanged', messageKey: 'errorDialog.hostKeyChanged' }
+    }
+    
+    // Authentication errors
+    if (s.includes('auth failed') || s.includes('auth error') || s.includes('authentication') || 
+        s.includes('no authentication') || s.includes('permission denied') || s.includes('invalid password')) {
+      return { type: 'auth', messageKey: 'errorDialog.authFailed' }
+    }
+    
+    // Network errors
+    if (s.includes('timeout') || s.includes('timed out') || s.includes('network unreachable')) {
+      return { type: 'network', messageKey: 'errorDialog.networkTimeout' }
+    }
+    
+    // Connection refused
+    if (s.includes('connection refused') || s.includes('host unreachable')) {
+      return { type: 'connection', messageKey: 'errorDialog.connectionRefused' }
+    }
+    
+    // Wrong key passphrase — the key file is intact but decryption failed
+    if (s.includes('passphrase')) {
+      return { type: 'key', messageKey: 'errorDialog.wrongPassphrase' }
+    }
+
+    // Encrypted key without passphrase — tell the user to add it in connection settings
+    if (s.includes('encrypted')) {
+      return { type: 'key', messageKey: 'errorDialog.keyEncrypted' }
+    }
+    
+    // Key file errors
+    if (s.includes('key') && (s.includes('not found') || s.includes('invalid'))) {
+      return { type: 'auth', messageKey: 'errorDialog.keyNotFound' }
+    }
+    
+    // Default: raw passthrough
+    return { type: 'other', message: errorMsg }
+  }
+
+  // Listen for host-key events from the backend (TOFU known_hosts verification).
+  // - host-key-confirm: first contact → show fingerprint dialog; user decision is sent
+  //   back via ssh_confirm_host_key, which resolves the paused handshake.
+  // - host-key-changed: recorded key differs → hard reject; show MITM warning.
+  useEffect(() => {
+    let cancelled = false
+    const unlistens: Array<() => void> = []
+    listen<{ sessionId: string; host: string; port: number; keyType: string; fingerprint: string }>(
+      'host-key-confirm',
+      (event) => {
+        if (cancelled) return
+        setHostKeyPrompt({
+          sessionId: event.payload.sessionId,
+          host: event.payload.host,
+          port: event.payload.port,
+          keyType: event.payload.keyType,
+          fingerprint: event.payload.fingerprint,
+        })
+      },
+    ).then((fn) => { if (cancelled) fn(); else unlistens.push(fn) })
+    listen<{ sessionId: string; host: string; port: number; keyType: string; fingerprint: string }>(
+      'host-key-changed',
+      (event) => {
+        if (cancelled) return
+        hostKeyChangedHandledRef.current = true
+        // Close any generic error dialog that raced ahead — the dedicated warning is authoritative
+        setErrorDialog(null)
+        setHostKeyChangedWarn({
+          host: event.payload.host,
+          port: event.payload.port,
+          keyType: event.payload.keyType,
+          fingerprint: event.payload.fingerprint,
+        })
+      },
+    ).then((fn) => { if (cancelled) fn(); else unlistens.push(fn) })
+    return () => { cancelled = true; unlistens.forEach((fn) => fn()) }
+  }, [])
+
+  const confirmHostKey = () => {
+    if (!hostKeyPrompt) return
+    const sid = hostKeyPrompt.sessionId
+    setHostKeyPrompt(null)
+    invoke('ssh_confirm_host_key', { sessionId: sid, trusted: true }).catch(() => {})
+  }
+
+  const rejectHostKey = () => {
+    if (!hostKeyPrompt) return
+    const sid = hostKeyPrompt.sessionId
+    setHostKeyPrompt(null)
+    invoke('ssh_confirm_host_key', { sessionId: sid, trusted: false }).catch(() => {})
+  }
+
+  const handleSelectConnection = (conn: SidebarConnection) => {
+    // ponytail: single-click switches to server if connected, otherwise connects
+    handleDirectConnect(conn)
+  }
+
+  const handleDirectConnect = useCallback(async (conn: SidebarConnection) => {
+    // ponytail: multi-session — if already connected, just switch tab
+    const existing = sessions.find(s => s.configId === conn.id)
+    const isConnected = existing !== undefined && connectedConfigIds.has(conn.id)
+    if (isConnected) {
+      setActiveConfigId(conn.id)
+      return
+    }
+
+    const doConnect = (username: string, password?: string, keyPath?: string, passphrase?: string, configId?: string) => {
+      setConnectingServerId(conn.id)
+      setError('')
+      const hostKey = `${conn.host}_${conn.port}`
+      const panelKey = `lastPanel_${username}@${hostKey}`
+      // ponytail: estimate PTY size from window so shell prompt renders correctly on first draw
+      const estCols = Math.max(80, Math.floor((window.innerWidth - (sidebarVisible ? sidebarWidth + 10 : 40) - 20) / 8.4))
+      const estRows = Math.max(24, Math.floor((window.innerHeight - 100) / 17))
+      // ponytail: parallel SSH + DB read → no flash, correct page rendered immediately
+      // 凭据策略：前端显式传入的 password/passphrase 为会话级覆盖（优先）；
+      // 未传入时 Rust 端按 configId 从系统钥匙串读取（已保存凭据不进前端）
+      // SSH 2FA（v10）：无需本地标记——认证时服务器要求验证码，后端发 'tfa-code-request'
+      // 事件，本页动态弹窗收集后经 ssh_submit_tfa_code 回传。
+      // NOTE: no client-side timeout here — the backend splits TCP connect (8s) from the
+      // SSH handshake (90s), and the handshake may pause on first-contact host-key confirmation.
+      Promise.all([
+        invoke<string>('ssh_connect', {
+          config: {
+            host: conn.host, port: conn.port, username,
+            password: password || undefined, keyPath,
+            passphrase: passphrase || undefined,
+            configId: configId || undefined,
+            authMode: conn.auth_mode || 'direct_root',
+            sudoPasswordMode: conn.sudo_password_mode || 'ask',
+            cols: estCols, rows: estRows,
+          },
+        }),
+        invoke<string>('ui_state_get', { key: panelKey }).catch(() => ''),
+      ]).then(([sid, savedPanel]) => {
+        if (existing) {
+          // ponytail: reconnect to existing disconnected tab — update sessionId, keep tab
+          setSessions(prev => prev.map(s => s.configId === conn.id ? { ...s, sessionId: sid } : s))
+        } else {
+          const newSession: ActiveSession = {
+            configId: conn.id,
+            sessionId: sid,
+            name: conn.name || conn.host,
+            hostKey,
+            username,
+            initialSection: savedPanel || 'dashboard',
+          }
+          setSessions(prev => [...prev, newSession])
+        }
+        setConnectedConfigIds(prev => new Set(prev).add(conn.id))
+        setActiveConfigId(conn.id)
+        manualDisconnectRef.current = false
+        // Show welcome modal on successful connection (once per 6 hours)
+        const WELCOME_INTERVAL = 6 * 60 * 60 * 1000
+        const lastShown = Number(localStorage.getItem('welcome_last_shown') || 0)
+        if (Date.now() - lastShown >= WELCOME_INTERVAL) {
+          setShowWelcome(true)
+          localStorage.setItem('welcome_last_shown', String(Date.now()))
+          setTimeout(() => setShowWelcome(false), 4000)
+        }
+      }).catch(e => {
+        const msg = String(e)
+        const { type, messageKey, params, message } = classifyError(msg)
+        // host-key-changed already shows a dedicated MITM warning — skip the generic dialog
+        if (hostKeyChangedHandledRef.current) {
+          hostKeyChangedHandledRef.current = false
+          return
+        }
+        setErrorDialog({ visible: true, type, messageKey, params, message })
+      }).finally(() => setConnectingServerId(null))
+    }
+
+    let password: string | undefined
+    let keyPath: string | undefined
+    let passphrase: string | undefined
+    let configId: string | undefined
+
+    // Only use stored credentials if remember_me is true
+    if (conn.remember_me) {
+      // 已保存密码由 Rust 端从系统钥匙串读取；这里仅校验"已保存"标记
+      if (conn.auth_type === 'password' && !conn.has_password) {
+        setErrorDialog({ visible: true, type: 'auth', messageKey: 'errorDialog.noPasswordSaved' })
+        return
+      }
+      if (conn.auth_type === 'key') keyPath = conn.key_path
+      // Fall back to session-memory cache (freshly created/edited connections aren't persisted)
+      // '' (blank input) means "no passphrase" — fall through || so empty string isn't sent as Some("")
+      if (conn.auth_type === 'key') passphrase = passphraseCacheRef.current.get(conn.id)
+      configId = conn.id
+    } else {
+      setErrorDialog({ visible: true, type: 'auth', messageKey: 'errorDialog.editToConfigure' })
+      return
+    }
+
+    // SSH 2FA（v10）：无需本地标记预判——认证时服务器要求验证码，后端发
+    // 'tfa-code-request' 事件，由动态弹窗收集后回传，连接流程不在此阻塞。
+    doConnect(conn.username, password, keyPath, passphrase, configId)
+  }, [sessions, connectedConfigIds])
+
+  // Listen for reconnect-after-edit from Sidebar (Connect button)
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail
+      if (detail?.conn) {
+        // Keep edited passphrase in session memory (not persisted) so immediate connect works
+        if (detail.conn.passphrase) passphraseCacheRef.current.set(detail.conn.id, detail.conn.passphrase)
+        // 权限模型修复：编辑后点"连接"必须强制重连——若该连接仍在线，旧会话的
+        // 身份/auth_mode 与新配置不匹配（此前 isConnected 短路只切 tab，导致
+        // "改成 root 后连接实际还在普通用户 session"之类的权限错乱）
+        const existing = sessions.find(s => s.configId === detail.conn.id)
+        if (existing && connectedConfigIds.has(detail.conn.id)) {
+          manualDisconnectRef.current = true
+          invoke('ssh_disconnect', { sessionId: existing.sessionId }).catch(() => {})
+          markDisconnected(detail.conn.id)
+        }
+        handleDirectConnect(detail.conn)
+      }
+    }
+    window.addEventListener('sidebar-reconnect-after-edit', handler)
+    return () => window.removeEventListener('sidebar-reconnect-after-edit', handler)
+  }, [handleDirectConnect])
+
+  // SSH 2FA（v10）：认证中服务器要求验证码 → 动态弹窗收集 → ssh_submit_tfa_code 回传
+  useEffect(() => {
+    const unlisten = listen<{ sessionId: string; retry?: boolean }>('tfa-code-request', (e) => {
+      setTfaCodeInput('')
+      setTfaRetryHint(!!e.payload.retry)
+      setTfaDialog({ sessionId: e.payload.sessionId })
+    })
+    return () => { unlisten.then(f => f()) }
+  }, [])
+
+  // 主动取消 2FA 弹窗（× 或取消按钮）：通知后端立即失败（不再等 120s 超时）
+  const cancelTfaDialog = () => {
+    if (tfaDialog) {
+      invoke('ssh_cancel_tfa_code', { sessionId: tfaDialog.sessionId }).catch(() => {})
+    }
+    setTfaDialog(null)
+    setTfaRetryHint(false)
+    setTfaCodeInput('')
+  }
+
+  return (
+    <div className="app">
+      {sidebarVisible && (
+        <>
+          <div style={{ width: sidebarWidth, minWidth: sidebarWidth, flexShrink: 0, display: 'flex', position: 'relative' }}>
+            <Sidebar onSelect={handleSelectConnection} onConnect={handleDirectConnect} onNew={() => {}} onCreateConnection={handleCreateConnection} refreshKey={sidebarRefreshKey} connectedIds={Array.from(connectedConfigIds)} connectingServerId={connectingServerId} activeConfigId={activeConfigId} onManageHostKeys={() => setShowHostKeysDialog(true)} />
+            {/* Sidebar Toggle Button */}
+            <button 
+              className="sidebar-toggle-btn visible"
+              onClick={() => setSidebarVisible(false)}
+              title={t('common.hidePanel')}
+            >
+              HIDE
+            </button>
+          </div>
+          <div
+            className="v-divider"
+            onMouseDown={() => startDrag('sidebar')}
+          />
+        </>
+      )}
+      {!sidebarVisible && (
+        <button 
+          className="sidebar-toggle-btn hidden"
+          onClick={() => setSidebarVisible(true)}
+          title={t('common.showPanel')}
+        >
+          SHOW
+        </button>
+      )}
+      <div className="main-area">
+        <div className="top-bar">
+          {error && <div className="error-bar">{error}</div>}
+          {/* ponytail: persistent reconnect bar — driven by state, not toast (no 4s flicker) */}
+          {activeConfigId && reconnectingSessions.has(activeConfigId) && (() => {
+            const info = reconnectingSessions.get(activeConfigId)!
+            return (
+              <div className="toast-bar">
+                <span>↻ [{info.name}] {t('common.reconnectAttempt', { attempt: info.attempt, max: settings.max_reconnect_attempts })}</span>
+                <button className="toast-stop-btn" onClick={() => {
+                  const cid = activeConfigId
+                  reconnectingActiveRef.current.delete(cid)
+                  reconnectAttemptRef.current.delete(cid)
+                  setReconnectingSessions(prev => { const m = new Map(prev); m.delete(cid); return m })
+                  handleDisconnectAction(cid)
+                }}>{t('common.stop')}</button>
+              </div>
+            )
+          })()}
+          {toast && !reconnectingSessions.has(activeConfigId || '') && !isDisconnected && (
+            <div className="toast-bar">
+              <span>{toast}</span>
+            </div>
+          )}
+          {/* ponytail: persistent disconnected toast-bar — always visible until reconnected */}
+          {isDisconnected && (
+            <div className="toast-bar disconnected-bar">⚠ {t('common.disconnectedBanner')}</div>
+          )}
+          {pendingUpdate && (
+            <div className="update-ready-bar">
+              <span>🔄 Update v{pendingUpdate.version} ready</span>
+              <button className="update-restart-btn" onClick={async () => { await pendingUpdate.install() }}>Restart Now</button>
+            </div>
+          )}
+        </div>
+        
+        {/* Error Dialog */}
+        {errorDialog?.visible && (
+          <div className="error-dialog-overlay" onClick={() => setErrorDialog(null)}>
+            <div className="error-dialog" onClick={(e) => e.stopPropagation()}>
+              <button className="error-dialog-close" onClick={() => setErrorDialog(null)}>×</button>
+              <div className="error-dialog-icon">
+                {errorDialog.type === 'auth' && '🔐'}
+                {errorDialog.type === 'network' && '🌐'}
+                {errorDialog.type === 'connection' && '⚠️'}
+                {errorDialog.type === 'key' && '🔑'}
+                {errorDialog.type === 'hostKey' && '🛡️'}
+                {errorDialog.type === 'hostKeyChanged' && '🚨'}
+                {errorDialog.type === 'other' && '❗'}
+              </div>
+              <div className="error-dialog-title">{t('errorDialog.connectionFailed')}</div>
+              <div className="error-dialog-message">{errorDialog.message ?? t(errorDialog.messageKey ?? '', errorDialog.params)}</div>
+              <div className="error-dialog-actions">
+                {(errorDialog.type === 'hostKey' || errorDialog.type === 'hostKeyChanged') && (
+                  <button
+                    className="error-dialog-btn primary"
+                    onClick={() => { setErrorDialog(null); setShowHostKeysDialog(true) }}
+                  >{t('hostKey.manage')}</button>
+                )}
+                <button className="error-dialog-btn secondary" onClick={() => setErrorDialog(null)}>{t('common.close')}</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* SSH 2FA（v10）：认证中服务器要求验证码 → 动态弹窗 → ssh_submit_tfa_code 回传。
+            弹窗不可点遮罩关闭（避免误触），只能 × / 确认 / 取消 三种有意操作；取消立即通知后端失败。 */}
+        {tfaDialog && (
+          <div className="error-dialog-overlay">
+            <div className="error-dialog" onClick={(e) => e.stopPropagation()}>
+              <button className="error-dialog-close" onClick={() => cancelTfaDialog()}>×</button>
+              <div className="error-dialog-icon">🔐</div>
+              <div className="error-dialog-title">{t('tfa.codeRequired')}</div>
+              {tfaRetryHint && (
+                <div style={{ color: 'var(--red)', fontSize: 12, margin: '-4px 0 8px' }}>{t('tfa.codeRetryHint')}</div>
+              )}
+              <div className="error-dialog-message">{t('tfa.codeRequiredHint')}</div>
+              <input
+                className="sidebar-edit-input"
+                style={{ width: '100%', boxSizing: 'border-box', marginBottom: 12, textAlign: 'center', letterSpacing: 4, fontSize: 16 }}
+                value={tfaCodeInput}
+                onChange={(e) => setTfaCodeInput(e.target.value.replace(/\D/g, ''))}
+                placeholder="••••••"
+                autoFocus
+                autoComplete="off"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && tfaCodeInput.length > 0) {
+                    const sessionId = tfaDialog.sessionId
+                    setTfaDialog(null)
+                    setTfaRetryHint(false)
+                    invoke('ssh_submit_tfa_code', { sessionId, code: tfaCodeInput }).catch(() => {})
+                  }
+                }}
+              />
+              <div className="error-dialog-actions">
+                <button
+                  className="error-dialog-btn primary"
+                  disabled={tfaCodeInput.length === 0}
+                  onClick={() => {
+                    const sessionId = tfaDialog.sessionId
+                    setTfaDialog(null)
+                    setTfaRetryHint(false)
+                    invoke('ssh_submit_tfa_code', { sessionId, code: tfaCodeInput }).catch(() => {})
+                  }}
+                >{t('common.confirm')}</button>
+                <button className="error-dialog-btn secondary" onClick={cancelTfaDialog}>{t('common.cancel')}</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* First-contact host key confirmation (TOFU) */}
+        {hostKeyPrompt && (
+          <div className="error-dialog-overlay" onClick={rejectHostKey}>
+            <div className="error-dialog" onClick={(e) => e.stopPropagation()}>
+              <button className="error-dialog-close" onClick={rejectHostKey}>×</button>
+              <div className="error-dialog-icon">🔐</div>
+              <div className="error-dialog-title">{t('hostKey.confirmTitle')}</div>
+              <div className="error-dialog-message">{t('hostKey.confirmDesc')}</div>
+              <div className="hostkey-info">
+                <div className="hostkey-info-row"><span>{t('hostKey.host')}</span><b>{hostKeyPrompt.host}</b></div>
+                <div className="hostkey-info-row"><span>{t('hostKey.port')}</span><b>{hostKeyPrompt.port}</b></div>
+                <div className="hostkey-info-row"><span>{t('hostKey.algorithm')}</span><b>{hostKeyPrompt.keyType}</b></div>
+                <div className="hostkey-info-row"><span>{t('hostKey.fingerprint')}</span><code className="hostkey-fp">{hostKeyPrompt.fingerprint}</code></div>
+              </div>
+              <div className="error-dialog-actions">
+                <button className="error-dialog-btn" onClick={rejectHostKey}>{t('hostKey.cancel')}</button>
+                <button className="error-dialog-btn primary" onClick={confirmHostKey}>{t('hostKey.trustAndConnect')}</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Host key changed — possible MITM warning (connection already rejected) */}
+        {hostKeyChangedWarn && (
+          <div className="error-dialog-overlay" onClick={() => setHostKeyChangedWarn(null)}>
+            <div className="error-dialog" onClick={(e) => e.stopPropagation()}>
+              <button className="error-dialog-close" onClick={() => setHostKeyChangedWarn(null)}>×</button>
+              <div className="error-dialog-icon">🚨</div>
+              <div className="error-dialog-title">{t('hostKey.changedTitle')}</div>
+              <div className="error-dialog-message">{t('hostKey.changedDesc')}</div>
+              <div className="hostkey-info">
+                <div className="hostkey-info-row"><span>{t('hostKey.host')}</span><b>{hostKeyChangedWarn.host}</b></div>
+                <div className="hostkey-info-row"><span>{t('hostKey.algorithm')}</span><b>{hostKeyChangedWarn.keyType}</b></div>
+                <div className="hostkey-info-row"><span>{t('hostKey.fingerprint')}</span><code className="hostkey-fp">{hostKeyChangedWarn.fingerprint}</code></div>
+              </div>
+              <div className="error-dialog-actions">
+                <button className="error-dialog-btn secondary" onClick={() => setHostKeyChangedWarn(null)}>{t('common.close')}</button>
+                <button className="error-dialog-btn primary" onClick={() => { setHostKeyChangedWarn(null); setShowHostKeysDialog(true) }}>{t('hostKey.manage')}</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Trusted host fingerprint manager */}
+        <HostKeysDialog open={showHostKeysDialog} onClose={() => setShowHostKeysDialog(false)} />
+        <div className="split-container" ref={splitContainerRef}>
+          {/* ponytail: session tab bar — quick switch between connected servers */}
+          {sessions.length > 0 && (
+            <div className="session-tabs">
+              {sessions.map(s => {
+                const reconInfo = reconnectingSessions.get(s.configId)
+                const isReconnecting = reconInfo !== undefined
+                const isTabConnected = connectedConfigIds.has(s.configId)
+                return (
+                <div
+                  key={s.configId}
+                  className={`session-tab ${s.configId === activeConfigId ? 'active' : ''} ${isReconnecting ? 'reconnecting' : ''} ${!isTabConnected && !isReconnecting ? 'disconnected' : ''}`}
+                  onClick={() => setActiveConfigId(s.configId)}
+                >
+                  {isReconnecting && <span className="session-tab-recon-icon" title={`Reconnecting... (${reconInfo!.attempt}/${settings.max_reconnect_attempts})`}>↻</span>}
+                  {!isTabConnected && !isReconnecting && <span className="session-tab-discon-icon" title="Disconnected">⚠</span>}
+                  <span className="session-tab-name">{s.name}</span>
+                  <button
+                    className="session-tab-close"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      if (isTabConnected) {
+                        manualDisconnectRef.current = true
+                        invoke('ssh_disconnect', { sessionId: s.sessionId }).catch(() => {})
+                        handleDisconnectAction(s.configId)
+                      } else {
+                        removeSession(s.configId)
+                      }
+                    }}
+                  >×</button>
+                </div>
+                )
+              })}
+            </div>
+          )}
+          <div className="split-full">
+            {sessions.map(s => (
+              <div key={s.configId + s.sessionId} style={{ display: s.configId === activeConfigId ? 'block' : 'none', height: '100%' }}>
+                <ServerPanel
+                  sessionId={s.sessionId}
+                  connHost={s.hostKey}
+                  connUsername={s.username}
+                  initialSection={s.initialSection}
+                  jumpToPath={s.configId === activeConfigId ? jumpToPath : null}
+                  setJumpToPath={setJumpToPath}
+                  termRef={{
+                    get current() { return termRefMap.current.get(s.configId) ?? null },
+                    set current(h: TerminalHandle | null) { termRefMap.current.set(s.configId, h); if (s.configId === activeConfigId) activeTermRef.current = h }
+                  }}
+                  onStartUpload={handleStartUpload}
+                  onUploadComplete={uploadCompleteRef}
+                  appSettings={settings}
+                  onToggleAutoReconnect={toggleAutoReconnect}
+                  onUpdateSettings={handleUpdateSettings}
+                />
+              </div>
+            ))}
+            {/* ponytail: show nav when no sessions — dashboard/discussions remain clickable, others disabled */}
+            {sessions.length === 0 && <ServerPanel sessionId={null} onShowToast={showToast} />}
+          </div>
+        </div>
+      </div>
+
+
+      {/* Floating Upload Panel */}
+      {upload.queue.length > 0 && (
+        <UploadPanel
+          upload={upload}
+          onPause={handlePauseUpload}
+          onResume={handleResumeUpload}
+          onStop={handleStopUpload}
+          onDismiss={handleDismissUpload}
+                    onRetry={handleRetryFailed}
+        />
+      )}
+
+      {/* Welcome Modal */}
+      {showWelcome && (
+        <div className="welcome-overlay">
+          <div className="welcome-modal">
+            <button className="welcome-close-btn" onClick={() => setShowWelcome(false)} title={t('common.close')}>×</button>
+            <div className="welcome-icon"></div>
+            <h2 className="welcome-title">{t('welcome.title')}</h2>
+            <p className="welcome-subtitle">{t('welcome.subtitle')}</p>
+            <div className="welcome-features">
+              <span>✓ {t('welcome.secureConnections')}</span>
+              <span>✓ {t('welcome.fileManagement')}</span>
+              <span>✓ {t('welcome.serverControl')}</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 权限模型 v8：全局 sudo 密码弹窗（ask 模式） */}
+      <SudoPasswordDialog />
+    </div>
+  )
+}
+
+
+
+function UploadPanel({ upload, onPause, onResume, onStop, onDismiss, onRetry }: {
+  upload: UploadState
+  onPause: () => void
+  onResume: () => void
+  onStop: () => void
+  onDismiss: () => void
+    onRetry: () => void
+}) {
+  const { t } = useTranslation()
+  const [collapsed, setCollapsed] = useState(false)
+  const [showStopConfirm, setShowStopConfirm] = useState(false)
+  const [stopInput, setStopInput] = useState('')
+  const stopInputRef = useRef<HTMLInputElement>(null)
+  const stopConfirmed = stopInput.trim().toLowerCase() === 'stop'
+  const pct = upload.totalBytes > 0 ? Math.round((upload.uploadedBytes / upload.totalBytes) * 100) : 0
+  const uploadedMB = (upload.uploadedBytes / 1048576).toFixed(1)
+  const totalMB = (upload.totalBytes / 1048576).toFixed(1)
+  const remainingMB = ((upload.totalBytes - upload.uploadedBytes) / 1048576).toFixed(1)
+  const speedStr = upload.speed >= 1048576
+    ? `${(upload.speed / 1048576).toFixed(1)} MB/s`
+    : `${(upload.speed / 1024).toFixed(0)} KB/s`
+  const doneCount = upload.queue.filter(q => q.status === 'done').length
+  const allDone = !upload.active && upload.queue.every(q => q.status === 'done' || q.status === 'error' || q.status === 'stopped')
+    const failedCount = upload.queue.filter(q => q.status === 'error').length
+
+  return (
+    <div className={`upload-panel ${collapsed ? 'collapsed' : ''}`}>
+      <div className="upload-panel-header" onClick={() => setCollapsed(!collapsed)}>
+        <span className="upload-panel-title">
+          📤 {upload.active ? (upload.paused ? t('upload.paused') : t('upload.uploading')) : allDone ? t('upload.complete') : t('upload.stopped')}
+          {' '}{doneCount}/{upload.queue.length}
+          {upload.active && !upload.paused && ` — ${pct}% — 👷 ${upload.workers}`}
+        </span>
+        <span className="upload-panel-toggle">{collapsed ? '▲' : '▼'}</span>
+      </div>
+      {!collapsed && (
+        <>
+          {upload.active && (
+            <div className="upload-panel-progress">
+              <div className="upload-progress-track">
+                <div className="upload-progress-fill" style={{ width: `${pct}%` }} />
+              </div>
+              <div className="upload-progress-info">
+                {uploadedMB}M / {totalMB}M | {t('upload.remaining')} {remainingMB}M | {speedStr}
+              </div>
+            </div>
+          )}
+          <div className="upload-panel-queue">
+            {upload.queue.map((item, i) => (
+              <div key={i} className={`upload-queue-item ${item.status}`}>
+                <span className="upload-item-icon">
+                  {item.status === 'done' ? '✅' : item.status === 'error' ? '❌' : item.status === 'stopped' ? '⏹' : item.status === 'uploading' ? '⬆️' : '⏳'}
+                </span>
+                <span className="upload-item-name" title={item.fileName}>{item.fileName}</span>
+                <span className="upload-item-size">{(item.file.size / 1048576).toFixed(1)}M</span>
+                {item.retryCount && item.retryCount > 0 && item.status === 'pending' && <span className="upload-item-retry">🔄 {item.retryCount}/3</span>}
+                {item.error && <span className="upload-item-error" title={item.error}>!</span>}
+              </div>
+            ))}
+          </div>
+          <div className="upload-panel-actions">
+            {upload.active && !upload.paused && (
+              <>
+                <button className="upload-btn" onClick={onPause} title={t('upload.pause')}>⏸ {t('upload.pause')}</button>
+                <button className="upload-btn" onClick={() => { setShowStopConfirm(true); setStopInput('') }} title={t('upload.stop')}>⏹ {t('upload.stop')}</button>
+              </>
+            )}
+            {upload.active && upload.paused && (
+              <>
+                <button className="upload-btn" onClick={onResume} title={t('upload.resume')}>▶ {t('upload.resume')}</button>
+                <button className="upload-btn" onClick={() => { setShowStopConfirm(true); setStopInput('') }} title={t('upload.stop')}>⏹ {t('upload.stop')}</button>
+              </>
+            )}
+            {!upload.active && (
+              <>
+                {failedCount > 0 && (
+                  <button className="upload-btn" onClick={onRetry} title={t('upload.retryFailed')}>🔄 {t('upload.retryFailed')} ({failedCount})</button>
+                )}
+                <button className="upload-btn" onClick={onDismiss} title={t('common.close')}>✕ {t('common.close')}</button>
+              </>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* Stop confirmation modal */}
+      {showStopConfirm && (
+        <div className="fb-dialog-overlay" onClick={() => setShowStopConfirm(false)}>
+          <div className="fb-dialog" onClick={(e) => e.stopPropagation()} style={{ minWidth: 380 }}>
+            <button className="modal-close-btn" onClick={() => setShowStopConfirm(false)} title={t('common.close')}>×</button>
+            <div className="fb-dialog-title" style={{ marginBottom: 12 }}>{t('upload.confirmStopTitle')}</div>
+            <p style={{ margin: '0 0 16px', fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+              {t('upload.confirmStopMsg')}
+            </p>
+            <input
+              ref={stopInputRef}
+              className="fb-dialog-input"
+              value={stopInput}
+              onChange={e => setStopInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && stopConfirmed) { onStop(); setShowStopConfirm(false) } }}
+              placeholder={t('upload.confirmStopPlaceholder')}
+              autoFocus
+              style={{ width: '100%', padding: '8px 12px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--text)', fontSize: 13, outline: 'none', boxSizing: 'border-box' }}
+            />
+            <div className="fb-dialog-actions">
+              <button className="fb-dialog-btn" onClick={() => setShowStopConfirm(false)}>{t('common.cancel')}</button>
+              <button className="fb-dialog-btn danger" disabled={!stopConfirmed} onClick={() => { onStop(); setShowStopConfirm(false) }} style={{ opacity: stopConfirmed ? 1 : 0.4 }}>
+                {t('upload.stop')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default App
