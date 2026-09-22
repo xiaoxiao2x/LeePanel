@@ -189,6 +189,77 @@ pub fn validate_container_action(a: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ===== Fail2ban 专用校验（防注入） =====
+
+/// Fail2ban jail 名：`[a-zA-Z0-9_-]`，≤64 字符（对应 filter/jail 命名约定）。
+pub fn validate_jail_name(s: &str) -> Result<(), String> {
+    if s.is_empty() || s.len() > 64
+        || !s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) {
+        return reject(s, "jail name");
+    }
+    Ok(())
+}
+
+/// 单个 IP（IPv4/IPv6，不含 CIDR）。
+pub fn validate_ip(s: &str) -> Result<(), String> {
+    if s.trim().parse::<std::net::IpAddr>().is_err() {
+        return reject(s, "IP address");
+    }
+    Ok(())
+}
+
+/// 单个 IP 或 CIDR（如 `1.2.3.4`、`10.0.0.0/8`、`::1`）。
+fn is_ip_or_cidr(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() { return false; }
+    if t.parse::<std::net::IpAddr>().is_ok() { return true; }
+    if let Some((ip, prefix)) = t.split_once('/') {
+        if ip.parse::<std::net::IpAddr>().is_ok() {
+            if let Ok(p) = prefix.parse::<u32>() {
+                let max = if ip.contains(':') { 128 } else { 32 };
+                return p <= max;
+            }
+        }
+    }
+    false
+}
+
+/// ignoreip：空格/逗号分隔的 IP 或 CIDR 列表（可含本机回环与局域网段）。
+pub fn validate_ignoreip(s: &str) -> Result<(), String> {
+    let t = s.trim();
+    if t.is_empty() { return Ok(()); }
+    if t.split(|c| c == ' ' || c == ',' || c == '\t')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .all(is_ip_or_cidr) {
+        return Ok(());
+    }
+    reject(s, "ignoreip list")
+}
+
+/// Fail2ban 时长：纯数字（秒）或 数字 + s/m/h/d/w 后缀（如 `600`、`10m`、`1h`）。
+pub fn validate_ban_time(s: &str) -> Result<(), String> {
+    let t = s.trim();
+    if t.is_empty() || t.len() > 16 { return reject(s, "ban time"); }
+    let (num, suffix) = match t.chars().last() {
+        Some(c) if c.is_ascii_digit() => (t, ""),
+        Some('s' | 'm' | 'h' | 'd' | 'w') => (&t[..t.len() - 1], &t[t.len() - 1..]),
+        _ => return reject(s, "ban time"),
+    };
+    if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
+        return reject(s, "ban time");
+    }
+    let _ = suffix;
+    Ok(())
+}
+
+/// maxretry：正整数。
+pub fn validate_pos_int(s: &str) -> Result<u32, String> {
+    let n: u32 = s.trim().parse().map_err(|_| format!("Invalid integer: '{}'", s))?;
+    if n == 0 { return Err("Invalid integer: must be > 0".to_string()); }
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +368,44 @@ mod tests {
         assert!(validate_container_action("start").is_ok());
         assert!(validate_container_action("restart").is_ok());
         assert!(validate_container_action("rm -rf /").is_err());
+    }
+
+    #[test]
+    fn jail_name_ok() {
+        assert!(validate_jail_name("sshd").is_ok());
+        assert!(validate_jail_name("nginx-http-auth").is_ok());
+        assert!(validate_jail_name("").is_err());
+        assert!(validate_jail_name("sshd; rm -rf /").is_err());
+        assert!(validate_jail_name("a b").is_err());
+    }
+
+    #[test]
+    fn ip_and_cidr_ok() {
+        assert!(validate_ip("1.2.3.4").is_ok());
+        assert!(validate_ip("::1").is_ok());
+        assert!(validate_ip("1.2.3.0/24").is_err());
+        assert!(validate_ip("abc").is_err());
+
+        assert!(validate_ignoreip("127.0.0.1/8 ::1 10.0.0.0/8").is_ok());
+        assert!(validate_ignoreip("").is_ok());
+        assert!(validate_ignoreip("1.2.3.4; rm -rf /").is_err());
+    }
+
+    #[test]
+    fn ban_time_ok() {
+        assert!(validate_ban_time("600").is_ok());
+        assert!(validate_ban_time("10m").is_ok());
+        assert!(validate_ban_time("1h").is_ok());
+        assert!(validate_ban_time("2d").is_ok());
+        assert!(validate_ban_time("-1").is_err());
+        assert!(validate_ban_time("10x").is_err());
+        assert!(validate_ban_time("abc").is_err());
+    }
+
+    #[test]
+    fn pos_int_ok() {
+        assert_eq!(validate_pos_int("5").unwrap(), 5);
+        assert!(validate_pos_int("0").is_err());
+        assert!(validate_pos_int("abc").is_err());
     }
 }

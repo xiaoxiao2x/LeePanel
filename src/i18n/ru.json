@@ -170,7 +170,8 @@
     "update": "Обновление",
     "settings": "Настройки",
     "discussions": "Обсуждения",
-    "2fa": "2FA"
+    "2fa": "2FA",
+    "fail2ban": "Fail2ban"
   },
   "quickCommands": {
     "manage": "Управление",

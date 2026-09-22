@@ -170,7 +170,8 @@
     "update": "업데이트",
     "settings": "설정",
     "discussions": "토론",
-    "2fa": "2FA 인증"
+    "2fa": "2FA 인증",
+    "fail2ban": "Fail2ban"
   },
   "quickCommands": {
     "manage": "관리",

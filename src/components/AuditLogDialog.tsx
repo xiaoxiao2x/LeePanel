@@ -31,6 +31,13 @@ const OP_LABELS: Record<string, string> = {
   tunnel_close: 'tunnel_close',
   tunnel_delete: 'tunnel_delete',
   tunnel_restore: 'tunnel_restore',
+  fail2ban_install: 'fail2ban_install',
+  fail2ban_uninstall: 'fail2ban_uninstall',
+  fail2ban_service_action: 'fail2ban_service_action',
+  fail2ban_ban_ip: 'fail2ban_ban_ip',
+  fail2ban_unban_ip: 'fail2ban_unban_ip',
+  fail2ban_set_jail: 'fail2ban_set_jail',
+  fail2ban_remove_jail: 'fail2ban_remove_jail',
 }
 
 function formatTime(ts: number): string {

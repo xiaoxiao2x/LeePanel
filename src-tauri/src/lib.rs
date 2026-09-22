@@ -2,6 +2,7 @@ mod audit;
 mod config;
 mod credentials;
 mod db;
+mod fail2ban;
 mod permissions;
 mod server;
 mod ssh;
@@ -92,6 +93,13 @@ pub fn run() {
             commands::tfa::tfa_get_status, commands::tfa::tfa_install,
             commands::tfa::tfa_configure,
             commands::tfa::tfa_enroll, commands::tfa::tfa_read_secret, commands::tfa::tfa_disable,
+            // Fail2ban
+            commands::fail2ban::fail2ban_get_status, commands::fail2ban::fail2ban_list_jails,
+            commands::fail2ban::fail2ban_list_bans, commands::fail2ban::fail2ban_read_config,
+            commands::fail2ban::fail2ban_install, commands::fail2ban::fail2ban_uninstall,
+            commands::fail2ban::fail2ban_service_action,
+            commands::fail2ban::fail2ban_ban_ip, commands::fail2ban::fail2ban_unban_ip,
+            commands::fail2ban::fail2ban_set_jail, commands::fail2ban::fail2ban_remove_jail,
             // Known hosts (SSH server identity, TOFU)
             commands::config::known_hosts_list, commands::config::known_hosts_delete,
             commands::config::known_hosts_add, commands::config::known_hosts_import_from_ssh,

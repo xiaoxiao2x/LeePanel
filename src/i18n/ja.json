@@ -170,7 +170,8 @@
     "update": "アップデート",
     "settings": "設定",
     "discussions": "ディスカッション",
-    "2fa": "2FA 認証"
+    "2fa": "2FA 認証",
+    "fail2ban": "Fail2ban"
   },
   "quickCommands": {
     "manage": "管理",
