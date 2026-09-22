@@ -27,6 +27,9 @@ dist-ssr
 target/
 src-tauri/target/
 
+# Tauri updater signing keys (never commit)
+.tauri/
+
 # Local cargo config (target-dir points to local D: drive, breaks CI on mac/linux)
 src-tauri/.cargo/config.toml
 
