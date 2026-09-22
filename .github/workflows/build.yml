@@ -81,6 +81,12 @@ jobs:
           releaseBody: "See the assets to download this version and install."
           releaseDraft: false
           prerelease: false
+          # 4 个 matrix job 会并行往同一个 release 上传同名资产。tauri-action 默认
+          # 每个 job 都生成/覆盖 latest.json，后写入者 delete+re-upload 换掉 asset id，
+          # 另一个 job 再拿旧 id 去 PATCH 就会 404（update-a-release-asset Not Found），
+          # 表现为随机某个平台构建失败、并连带 generate-updater-json 被跳过。
+          # 真正的更新清单由下方 generate-updater-json 汇总各平台生成，这里关掉。
+          includeUpdaterJson: false
           args: --target ${{ matrix.target }}
 
       - name: Upload artifacts
