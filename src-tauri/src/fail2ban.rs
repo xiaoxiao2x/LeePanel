@@ -125,7 +125,7 @@ process_file() {
   local section="" line key val
   while IFS= read -r line || [ -n "$line" ]; do
     line="${line//$'\r'/}"
-    [[ "$line" =~ ^[[:space:]]*[#;] ]] && continue
+    [[ "$line" =~ ^[[:space:]]*[#\;] ]] && continue
     if [[ "$line" =~ ^[[:space:]]*\[([^]]*)\] ]]; then
       section="${BASH_REMATCH[1]}"
       section="${section//[[:space:]]/}"
@@ -185,7 +185,7 @@ for j in $(printf '%s\n' "${!JAILS[@]}" | sort); do
   echo "JAIL|$j|$en|${CB:-0}|${CF:-0}|${TB:-0}|${TF:-0}|${MAXRETRY[$j]}|${BANTIME[$j]}|${FINDTIME[$j]}|${IGNOREIP[$j]}"
 done
 "#;
-    let (stdout, _, _) = crate::ssh::session_exec_with_output(session, script, 30).await?;
+    let (stdout, stderr, exit_code) = crate::ssh::session_exec_with_output(session, script, 30).await?;
 
     let mut list = Vec::new();
     for line in stdout.lines() {
@@ -209,6 +209,19 @@ done
             ignoreip: parts[10].to_string(),
         });
     }
+    // 脚本本身出错时必须报错，不能静默返回空列表——否则 UI 会误显示"暂无 jail"。
+    if list.is_empty() && exit_code != 0 {
+        let detail = stderr
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        return Err(format!(
+            "fail2ban jail 枚举脚本执行失败 (exit {}): {}",
+            exit_code,
+            if detail.is_empty() { "无 stderr 输出" } else { detail }
+        ));
+    }
     if let Ok(json) = serde_json::to_string(&list) {
         cache.put(session_id, "fail2ban_jails", json);
     }
@@ -229,23 +242,31 @@ if [ -f "$DB" ] && command -v python3 >/dev/null 2>&1; then
   python3 - "$JAIL" <<'PY'
 import sqlite3, time, sys
 jail = sys.argv[1]
+now = int(time.time())
 try:
     conn = sqlite3.connect('/var/lib/fail2ban/fail2ban.sqlite3')
-    conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    now = int(time.time())
     rows = cur.execute("SELECT ip, timeofban, bantime FROM bans WHERE jail = ?", (jail,)).fetchall()
-    for r in rows:
-        ip = r["ip"] or ""
-        bt = r["bantime"]
+    # bans 表没有唯一键、且会保留已过期的记录：先按 IP 取最新一条，再滤掉已过期的
+    best = dict()
+    for ip, t, bt in rows:
+        if not ip:
+            continue
+        if ip not in best or t > best[ip][0]:
+            best[ip] = (t, bt)
+    out = []
+    for ip, (t, bt) in best.items():
         if bt is None:
             rem = -2
         elif bt < 0:
             rem = -1
         else:
-            rem = r["timeofban"] + bt - now
-            if rem < 0:
-                rem = 0
+            rem = t + bt - now
+            if rem <= 0:
+                continue
+        out.append((ip, rem))
+    out.sort(key=lambda x: (x[1] < 0, x[1]))
+    for ip, rem in out:
         print("BAN|%s|%s" % (ip, rem))
     conn.close()
 except Exception:

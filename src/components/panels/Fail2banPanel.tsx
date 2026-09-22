@@ -432,7 +432,7 @@ export default function Fail2banPanel({ sessionId, connHost }: Fail2banPanelProp
                   </div>
                 ))}
               </div>
-            ) : (
+            ) : error ? null : (
               <div className="firewall-empty">
                 {t('fail2ban.noJails')}
               </div>
